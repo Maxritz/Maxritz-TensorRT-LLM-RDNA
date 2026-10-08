@@ -12,18 +12,22 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Non-streaming OpenAI-compatible text/chat serving for the ROCm backend."""
+"""OpenAI-compatible text/chat serving for the ROCm backend."""
 
 from __future__ import annotations
 
 import hmac
+import json
 import os
+import threading
 import time
 import uuid
+from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import Field
 from starlette.concurrency import run_in_threadpool
 
@@ -39,8 +43,10 @@ class CompletionRequest(SamplingParams):
         description="Text or token-ID prompt(s)."
     )
     stream: bool = Field(
-        default=False, description="Streaming is not supported by the portable server."
+        default=False,
+        description="Return OpenAI-compatible server-sent events for one completion.",
     )
+    adapter: str | None = Field(default=None, description="Name of a loaded PEFT adapter.")
 
 
 class ChatMessage(StrictBaseModel):
@@ -54,8 +60,10 @@ class ChatRequest(SamplingParams):
     model: str = Field(description="The served model name.")
     messages: list[ChatMessage] = Field(min_length=1, description="Conversation messages.")
     stream: bool = Field(
-        default=False, description="Streaming is not supported by the portable server."
+        default=False,
+        description="Return OpenAI-compatible server-sent events for one completion.",
     )
+    adapter: str | None = Field(default=None, description="Name of a loaded PEFT adapter.")
 
 
 def _usage(results: list[RequestOutput]) -> dict[str, int]:
@@ -66,6 +74,12 @@ def _usage(results: list[RequestOutput]) -> dict[str, int]:
         "completion_tokens": completion,
         "total_tokens": prompt + completion,
     }
+
+
+def _sse(payload: dict | str) -> str:
+    """Encode one OpenAI server-sent event without trusting model text as JSON."""
+    content = payload if isinstance(payload, str) else json.dumps(payload, separators=(",", ":"))
+    return f"data: {content}\n\n"
 
 
 def create_app(engine: LLM, served_model_name: str | None = None) -> FastAPI:
@@ -104,21 +118,97 @@ def create_app(engine: LLM, served_model_name: str | None = None) -> FastAPI:
     def check_request(request: CompletionRequest | ChatRequest) -> None:
         if request.model != model_name:
             raise HTTPException(status_code=404, detail=f"Model {request.model!r} is not served")
-        if request.stream:
-            raise HTTPException(
-                status_code=400, detail="Streaming is not implemented by the ROCm backend"
-            )
 
-    async def generate(prompt, request: CompletionRequest | ChatRequest) -> list[RequestOutput]:
-        params = SamplingParams(
-            **request.model_dump(exclude={"model", "prompt", "messages", "stream"})
+    def sampling(request: CompletionRequest | ChatRequest) -> SamplingParams:
+        return SamplingParams(
+            **request.model_dump(exclude={"model", "prompt", "messages", "stream", "adapter"})
         )
+
+    async def generate(
+        prompt, params: SamplingParams, adapter_name: str | None
+    ) -> list[RequestOutput]:
         try:
-            return await run_in_threadpool(engine.generate, prompt, params)
+            result = await run_in_threadpool(
+                engine.generate, prompt, params, adapter_name=adapter_name
+            )
+            # ``streaming=False`` above guarantees the ordinary list surface.
+            return result  # type: ignore[return-value]
         except (ValueError, TypeError, NotImplementedError) as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         except RuntimeError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
+
+    def stream_events(
+        prompt: str | list[int], params: SamplingParams, *, chat: bool, adapter_name: str | None
+    ) -> Iterator[str]:
+        """Bridge the synchronous portable streamer to OpenAI SSE framing."""
+        stream_id = ("chatcmpl" if chat else "cmpl") + f"-{uuid.uuid4().hex}"
+        created = int(time.time())
+        if chat:
+            yield _sse(
+                {
+                    "id": stream_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [
+                        {"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}
+                    ],
+                }
+            )
+        cancelled = threading.Event()
+        try:
+            for output in engine.generate_stream(
+                prompt,
+                params,
+                cancellation_event=cancelled,
+                adapter_name=adapter_name,
+            ):
+                if chat:
+                    choice = {
+                        "index": 0,
+                        "delta": ({"content": output.text} if output.text else {}),
+                        "finish_reason": output.finish_reason,
+                    }
+                    object_name = "chat.completion.chunk"
+                else:
+                    choice = {
+                        "index": 0,
+                        "text": output.text,
+                        "finish_reason": output.finish_reason,
+                        "logprobs": None,
+                    }
+                    object_name = "text_completion"
+                yield _sse(
+                    {
+                        "id": stream_id,
+                        "object": object_name,
+                        "created": created,
+                        "model": model_name,
+                        "choices": [choice],
+                    }
+                )
+        except (ValueError, TypeError, NotImplementedError) as error:
+            yield _sse({"error": {"message": str(error), "type": type(error).__name__}})
+        except RuntimeError as error:
+            yield _sse({"error": {"message": str(error), "type": "service_unavailable"}})
+        finally:
+            cancelled.set()
+        yield _sse("[DONE]")
+
+    def streaming_response(
+        prompt: str | list[int], params: SamplingParams, *, chat: bool, adapter_name: str | None
+    ) -> StreamingResponse:
+        if params.n != 1 or params.beam_width != 1:
+            raise HTTPException(
+                status_code=400,
+                detail="Streaming supports n=1 and beam_width=1; use non-streaming for other modes",
+            )
+        return StreamingResponse(
+            stream_events(prompt, params, chat=chat, adapter_name=adapter_name),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
 
     @app.get("/health")
     def health() -> dict:
@@ -137,9 +227,26 @@ def create_app(engine: LLM, served_model_name: str | None = None) -> FastAPI:
         }
 
     @app.post("/v1/completions", dependencies=[Depends(authenticate)])
-    async def completions(request: CompletionRequest) -> dict:
+    async def completions(request: CompletionRequest) -> object:
         check_request(request)
-        results = await generate(request.prompt, request)
+        params = sampling(request)
+        if request.stream:
+            if not isinstance(request.prompt, str) and not (
+                isinstance(request.prompt, list)
+                and request.prompt
+                and all(
+                    isinstance(token, int) and not isinstance(token, bool)
+                    for token in request.prompt
+                )
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Streaming accepts one text prompt or one nonempty list of token IDs",
+                )
+            return streaming_response(
+                request.prompt, params, chat=False, adapter_name=request.adapter
+            )
+        results = await generate(request.prompt, params, request.adapter)
         choices = [
             {
                 "index": index,
@@ -161,8 +268,9 @@ def create_app(engine: LLM, served_model_name: str | None = None) -> FastAPI:
         }
 
     @app.post("/v1/chat/completions", dependencies=[Depends(authenticate)])
-    async def chat(request: ChatRequest) -> dict:
+    async def chat(request: ChatRequest) -> object:
         check_request(request)
+        params = sampling(request)
         try:
             prompt = engine.tokenizer.apply_chat_template(
                 [message.model_dump() for message in request.messages],
@@ -173,7 +281,9 @@ def create_app(engine: LLM, served_model_name: str | None = None) -> FastAPI:
             raise HTTPException(
                 status_code=400, detail=f"Tokenizer chat template required: {error}"
             ) from error
-        results = await generate(prompt, request)
+        if request.stream:
+            return streaming_response(prompt, params, chat=True, adapter_name=request.adapter)
+        results = await generate(prompt, params, request.adapter)
         choices = [
             {
                 "index": output.index,

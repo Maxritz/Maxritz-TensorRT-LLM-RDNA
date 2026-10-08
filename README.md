@@ -4,7 +4,8 @@ This fork adds a separate Linux **gfx1200/gfx1201 ROCm backend**, ISA-aware wave
 kernels, and opt-in `--profile` reports with component/per-file timings and
 **CPU, RAM, GPU and VRAM utilization**.
 
-**[ROCm installation, support matrix, profiling and local validation](docs/source/rocm-rdna4.md)**
+**[ROCm installation, support matrix, profiling and local validation](docs/source/rocm-rdna4.md)** ·
+**[RDNA4 porting roadmap and extension ledger](docs/source/rdna4-porting-roadmap.md)**
 
 Install RDNA4-compatible HIP PyTorch first, then use
 `TRTLLM_BUILD_BACKEND=rocm pip install --no-deps -e .`. Run `trtllm-rdna4 doctor`.

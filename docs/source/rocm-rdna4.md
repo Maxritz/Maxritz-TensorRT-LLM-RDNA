@@ -19,17 +19,20 @@ claim of complete NVIDIA feature parity.
 | GPU/runtime | Linux, real gfx1200/gfx1201, RDNA4-compatible HIP PyTorch. Other architectures and `HSA_OVERRIDE_GFX_VERSION` are rejected. |
 | Model loading | Unquantized Hugging Face `AutoModelForCausalLM` checkpoints or an existing model/tokenizer. Remote model code is disabled by default. |
 | Execution | Single GPU; batched causal generation; ordinary HF cache; explicit context/batch limits; FP32, FP16, BF16 GPU storage. |
-| Python entry points | `tensorrt_llm.LLM`, `tensorrt_llm.llmapi.LLM`, `tensorrt_llm._torch.LLM` and portable `SamplingParams`/outputs. The portable API is smaller than the upstream executor API. |
+| Python entry points | `tensorrt_llm.LLM`, `tensorrt_llm.AsyncLLM`, `tensorrt_llm.EmbeddingLLM`, `tensorrt_llm.llmapi.LLM`/`AsyncLLM`, `tensorrt_llm._torch.LLM` and portable `SamplingParams`/outputs. The portable API is smaller than the upstream executor API. |
 | Default kernels | ROCm PyTorch operators and ROCm BLAS; SDPA or eager attention. No NVIDIA-only dependencies are required. |
 | Native HIP kernels | RMSNorm, add+RMSNorm, one-dimensional affine LayerNorm, SiLU/GELU gating, partial rotary embedding and causal/noncausal/GQA attention. FP32 reductions/attention accumulation; output storage rounding. |
 | Native model integration | `kernels="hip"` replaces compatible Llama/Mistral/Qwen2/Qwen3/Phi3 RMSNorms and affine 1D LayerNorms. `attn_backend="hip"` additionally uses native attention for Llama/Mistral/Qwen2/Qwen3 with head dimensions ≤256. |
 | Rotary / gating primitives | Available through `tensorrt_llm.rocm.ops`; not automatically substituted into every HF model implementation. |
 | Sampling | Greedy, temperature/top-p/top-k, repetition penalty, seed, multiple completions, HF beam search, EOS and decoded stop strings. No logprob materialization. |
-| Serving | Non-streaming OpenAI-compatible completions/chat, health and model discovery. Generation is serialized; this is not an in-flight batching scheduler. |
+| Serving | OpenAI-compatible completions/chat, health and model discovery. Single-prompt `stream=true` uses server-sent events on CPU/HIP; `n=1` and `beam_width=1` are required. Generation is serialized; this is not an in-flight batching scheduler. |
+| Embeddings | Portable `EmbeddingLLM` uses Hugging Face `AutoModel` hidden states with mean/CLS/last-token pooling and optional L2 normalization. `trtllm-rdna4 serve-embeddings` exposes `/v1/embeddings`; no Matryoshka projection or cross-request batching. |
+| Adapters | One static PEFT LoRA adapter can be loaded for causal generation with `lora_adapter`/`--lora-adapter`, optionally merged. Per-request adapters, hot swapping and adapter-aware batching are not implemented. |
+| Async API | `AsyncLLM` has a bounded serialized request queue, moves blocking executor work off the event loop, and provides a bounded async stream bridge. Cancelling a queued request prevents its start; it cannot interrupt an in-flight Transformers generation after a client disconnect. |
 | Benchmarks | Real serial latency/throughput, excluding warmup; includes tokenization, transfers, generation and detokenization. Not TTFT or streaming token latency. |
 | Profiling | Sherlock-style component table, per-file/function host data, HIP/CUDA event spans, CPU/RAM/GPU/VRAM sampling, JSON/text/Chrome/cProfile outputs. |
 | CPU mode | Explicit `device="cpu"` reference/testing mode, FP32 by default. It is never a fallback for an unavailable GPU. Half-precision model execution depends on your CPU PyTorch build. |
-| Not ported | TensorRT plans/plugins/builders; CUDA graphs; FlashInfer/CUTLASS/PTX/CDNA-specific fused code; quantized engines; tensor/pipeline/expert parallelism; RCCL/disaggregated cache exchange; paged/native KV manager; speculative decoding; LoRA; VisualGen/multimodal; upstream AsyncLLM, streaming, guided decoding and evaluation CLI. Unsupported options fail rather than being silently ignored. |
+| Not ported | TensorRT plans/plugins/builders; CUDA graphs; FlashInfer/CUTLASS/PTX/CDNA-specific fused code; quantized engines; tensor/pipeline/expert parallelism; RCCL/disaggregated cache exchange; paged/native KV manager; speculative decoding; adapter hot swapping; VisualGen/multimodal; guided decoding and evaluation CLI. Unsupported options fail rather than being silently ignored. See the [porting backlog](rdna4-porting-roadmap.md) for the feature-by-feature replacement plan. |
 
 Models must fit in the selected device's VRAM. An HF model relying on custom CUDA
 extensions or unsupported SDPA is not made portable merely by loading its weights.
@@ -112,7 +115,11 @@ TRTLLM_BUILD_BACKEND=rocm python -m build --wheel
 `TRTLLM_BACKEND=rocm` can explicitly select the portable backend for CPU tests with
 CPU-only or CUDA Torch. It does not authorize NVIDIA GPU execution as ROCm.
 `trtllm-rdna4` selects ROCm before importing the library, so its doctor command can
-also diagnose a wrongly installed Torch wheel without loading TensorRT bindings.
+also diagnose a wrongly installed Torch wheel without loading TensorRT bindings. Its
+`optional_capabilities` report detects AITER, Triton, PEFT, bitsandbytes, Outlines,
+lm-eval and PyTorch's RCCL transport surface without importing their native code.
+`installed: true` is only a dependency
+signal; the report describes the separate target qualification still required.
 
 PyTorch deliberately calls HIP devices **`cuda:N`** and exposes stream/event APIs
 under `torch.cuda`. These names do not mean NVIDIA code is used. On a mixed-architecture
@@ -151,6 +158,33 @@ MAX_JOBS=2 trtllm-rdna4 generate --model /path/to/llama-checkpoint \
   --prompt 'Hello' --max-tokens 32
 ```
 
+A static PEFT adapter is an explicitly optional correctness layer (not an adapter scheduler):
+
+```bash
+trtllm-rdna4 generate --model /path/to/hf-checkpoint --lora-adapter /path/to/adapter \
+  --local-files-only --prompt 'Hello' --max-tokens 32
+```
+
+Install a PEFT version compatible with the installed Transformers version before using
+that option. `--merge-lora` requests PEFT's one-way merge after loading; it cannot be
+used for adapter switching.
+
+## Embed
+
+```bash
+trtllm-rdna4 embed --model /path/to/hf-encoder --local-files-only \
+  --input 'RDNA4 uses wave32 execution.' --pooling mean
+trtllm-rdna4 serve-embeddings --model /path/to/hf-encoder --local-files-only \
+  --host 0.0.0.0 --port 8001 --served-model-name local-embedder
+```
+
+The embedding endpoint is `/v1/embeddings`, with `/health` and `/v1/models` alongside
+it. It accepts string inputs or token-ID arrays over the HTTP API and returns standard
+float arrays. It cannot apply OpenAI `dimensions` projections, and is a separate model
+process from the causal completions server. In Python, import `EmbeddingLLM` or
+`AsyncLLM` from `tensorrt_llm`; `AsyncLLM` is a nonblocking facade for the same
+single-model serialized execution contract.
+
 Only an explicit `kernels="hip"`/`--kernels hip` request invokes the local JIT compiler.
 Use a matching ROCm SDK/`hipcc`, host C++ compiler and Ninja; set `ROCM_HOME` if needed.
 Builds use PyTorch's extension cache and compile for both gfx1200 and gfx1201 with
@@ -173,7 +207,9 @@ trtllm-bench --model /path/to/hf-checkpoint throughput --local-files-only \
 ```
 
 Endpoints: `/health`, `/v1/models`, `/v1/completions`, `/v1/chat/completions`.
-Chat requires a tokenizer chat template. Unknown request fields, streaming and
+Chat requires a tokenizer chat template. `stream=true` emits OpenAI-style SSE for
+one completion (`n=1`, `beam_width=1`); batch, beam and multi-completion streams
+are rejected instead of being interleaved ambiguously. Unknown request fields and
 unsupported sampling/logprob features are rejected. The server binds to loopback
 (`127.0.0.1`) by default; use `--host 0.0.0.0` only when external access is intended.
 It has no TLS and no

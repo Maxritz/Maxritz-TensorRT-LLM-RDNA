@@ -6,11 +6,11 @@ from typing import NoReturn
 from .. import _BACKEND
 
 if _BACKEND == "rocm":
-    from ..rocm import LLM, CompletionOutput, RequestOutput, SamplingParams
+    from ..rocm import AsyncLLM, CompletionOutput, LLM, RequestOutput, SamplingParams
 
-    __all__ = ["LLM", "SamplingParams", "CompletionOutput", "RequestOutput"]
+    __all__ = ["LLM", "AsyncLLM", "SamplingParams", "CompletionOutput", "RequestOutput"]
     _NVIDIA_EXPORTS = frozenset([
-        'AsyncLLM', 'AttentionDpConfig', 'AutoDecodingConfig', 'BatchingType',
+        'AttentionDpConfig', 'AutoDecodingConfig', 'BatchingType',
         'BlockReuseConfig', 'CacheTransceiverConfig', 'CalibConfig',
         'CapacitySchedulerPolicy', 'ColdPageQuantizationCompressionConfig',
         'ContextChunkingPolicy', 'ConversationParams', 'CudaGraphConfig',

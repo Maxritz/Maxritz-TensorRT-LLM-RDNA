@@ -59,6 +59,10 @@ class SamplingParams(StrictBaseModel):
     ignore_eos: bool = Field(
         default=False, description="Ignore EOS and continue to a stop string or length limit."
     )
+    guided_choice: list[str] | None = Field(
+        default=None,
+        description="Optional exact completion choices, enforced by a portable token-prefix mask.",
+    )
 
     @model_validator(mode="after")
     def _check_constraints(self) -> "SamplingParams":
@@ -71,6 +75,11 @@ class SamplingParams(StrictBaseModel):
         strings = [self.stop] if isinstance(self.stop, str) else (self.stop or [])
         if any(not string for string in strings):
             raise ValueError("Stop strings must not be empty")
+        if self.guided_choice is not None:
+            if not self.guided_choice or any(not choice for choice in self.guided_choice):
+                raise ValueError("guided_choice must contain one or more nonempty strings")
+            if len(set(self.guided_choice)) != len(self.guided_choice):
+                raise ValueError("guided_choice values must be unique")
         return self
 
 
@@ -79,7 +88,7 @@ class CompletionOutput:
     index: int
     text: str
     token_ids: list[int]
-    finish_reason: Literal["stop", "length"]
+    finish_reason: Literal["stop", "length", "cancelled"]
     cumulative_logprob: float | None = None
 
 
@@ -92,4 +101,20 @@ class RequestOutput:
     finished: bool = True
 
 
-__all__ = ["SamplingParams", "CompletionOutput", "RequestOutput"]
+@dataclass
+class StreamOutput:
+    """One lossless text delta from :meth:`LLM.generate_stream`.
+
+    ``token_ids`` is populated only on the terminal item, where it contains the
+    final completion IDs with a terminal EOS removed. This keeps streaming
+    output inexpensive while preserving exact token accounting once generation
+    has completed.
+    """
+
+    request_id: int
+    text: str
+    finish_reason: Literal["stop", "length", "cancelled"] | None = None
+    token_ids: list[int] | None = None
+
+
+__all__ = ["SamplingParams", "CompletionOutput", "RequestOutput", "StreamOutput"]

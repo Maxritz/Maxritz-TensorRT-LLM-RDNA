@@ -91,6 +91,8 @@ def resolve_dtype(
 
 def diagnostics() -> dict:
     """Return actionable installation/device information, even on a CPU-only host."""
+    from .capabilities import optional_capabilities
+
     devices = []
     if torch.cuda.is_available():
         for index in range(torch.cuda.device_count()):
@@ -128,6 +130,7 @@ def diagnostics() -> dict:
         },
         "architecture_override": os.environ.get("HSA_OVERRIDE_GFX_VERSION"),
         "kernel_choices": ["torch", "hip"],
+        "optional_capabilities": optional_capabilities(),
     }
 
 

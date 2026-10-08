@@ -75,8 +75,16 @@ def test_stop_strings_do_not_match_the_prompt(engine) -> None:
 def test_context_validation_streaming_and_shutdown(engine) -> None:
     with pytest.raises(ValueError, match="exceeds max_seq_len"):
         engine.generate("tok4", SamplingParams(max_tokens=128))
-    with pytest.raises(NotImplementedError, match="Streaming"):
-        engine.generate("tok4", streaming=True)
+    params = SamplingParams(temperature=0, max_tokens=3, ignore_eos=True)
+    chunks = list(engine.generate("tok4", params, streaming=True))
+    assert chunks[-1].text == ""
+    assert chunks[-1].finish_reason == "length"
+    assert len(chunks[-1].token_ids) == 3
+    assert "".join(chunk.text for chunk in chunks[:-1]) == engine.tokenizer.decode(
+        chunks[-1].token_ids, skip_special_tokens=True
+    )
+    with pytest.raises(NotImplementedError, match="one completion"):
+        list(engine.generate("tok4", SamplingParams(n=2), streaming=True))
     with pytest.raises(ValueError, match="outside"):
         engine.generate([1000], SamplingParams(max_tokens=1))
     engine.shutdown()

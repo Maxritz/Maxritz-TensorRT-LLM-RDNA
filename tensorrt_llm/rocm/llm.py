@@ -21,23 +21,25 @@ import threading
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal
 
 import torch
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
+    LogitsProcessor,
     PreTrainedModel,
     PreTrainedTokenizerBase,
     StoppingCriteria,
     StoppingCriteriaList,
+    TextIteratorStreamer,
 )
 
 from trtllm_profile import active_session, component, trace_active
 
 from .runtime import KernelBackend, resolve_device, resolve_dtype
-from .sampling import CompletionOutput, RequestOutput, SamplingParams
+from .sampling import CompletionOutput, RequestOutput, SamplingParams, StreamOutput
 
 
 class _StopStrings(StoppingCriteria):
@@ -68,6 +70,46 @@ class _StopStrings(StoppingCriteria):
         )
 
 
+class _CancellationCriteria(StoppingCriteria):
+    """Stop generation at the next decoding step when a request is cancelled."""
+
+    def __init__(self, event: threading.Event) -> None:
+        self.event = event
+
+    def __call__(
+        self, input_ids: torch.Tensor, scores: torch.Tensor | None, **kwargs
+    ) -> torch.Tensor:
+        return torch.full(
+            (input_ids.shape[0],), self.event.is_set(), dtype=torch.bool, device=input_ids.device
+        )
+
+
+class _ChoiceProcessor(LogitsProcessor):
+    """Portable exact-choice constrained decoding without a CUDA grammar runtime."""
+
+    def __init__(self, choices: list[list[int]], prompt_width: int, eos_ids: list[int]) -> None:
+        self.choices = choices
+        self.prompt_width = prompt_width
+        self.eos_ids = eos_ids
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        constrained = torch.full_like(scores, -float("inf"))
+        for row, sequence in enumerate(input_ids.tolist()):
+            generated = sequence[self.prompt_width :]
+            allowed = set()
+            for choice in self.choices:
+                if choice[: len(generated)] != generated:
+                    continue
+                if len(generated) == len(choice):
+                    allowed.update(self.eos_ids)
+                else:
+                    allowed.add(choice[len(generated)])
+            if not allowed:
+                raise ValueError("guided_choice has no valid token continuation")
+            constrained[row, list(allowed)] = scores[row, list(allowed)]
+        return constrained
+
+
 class LLM:
     """Generate text with ROCm PyTorch/Hugging Face on one genuine RDNA4 GPU.
 
@@ -84,6 +126,7 @@ class LLM:
         tokenizer: str | Path | PreTrainedTokenizerBase | None = None,
         device: str | torch.device = "cuda:0",
         dtype: str | torch.dtype = "auto",
+        quantization: Literal["none", "bitsandbytes-4bit", "bitsandbytes-8bit"] = "none",
         max_batch_size: int = 1,
         max_seq_len: int | None = None,
         attn_backend: Literal["sdpa", "eager", "hip"] = "sdpa",
@@ -91,6 +134,15 @@ class LLM:
         revision: str | None = None,
         trust_remote_code: bool = False,
         local_files_only: bool = False,
+        draft_model: str | Path | PreTrainedModel | None = None,
+        draft_tokenizer: str | Path | PreTrainedTokenizerBase | None = None,
+        num_draft_tokens: int = 4,
+        paged_kv_cache: bool = False,
+        kv_cache_pages: int = 1024,
+        kv_cache_page_size: int = 16,
+        kv_cache_quantization: Literal["none", "int8"] = "none",
+        lora_adapter: str | Path | None = None,
+        merge_lora: bool = False,
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
         **unsupported,
@@ -103,10 +155,21 @@ class LLM:
             )
         if max_batch_size < 1 or (max_seq_len is not None and max_seq_len < 1):
             raise ValueError("max_batch_size and max_seq_len must be positive")
+        if num_draft_tokens < 1:
+            raise ValueError("num_draft_tokens must be positive")
+        if kv_cache_pages < 1 or kv_cache_page_size < 1:
+            raise ValueError("kv_cache_pages and kv_cache_page_size must be positive")
+        if kv_cache_quantization not in ("none", "int8"):
+            raise ValueError("kv_cache_quantization must be none or int8")
+        if quantization not in ("none", "bitsandbytes-4bit", "bitsandbytes-8bit"):
+            raise ValueError("Unsupported quantization mode")
         if attn_backend not in ("sdpa", "eager", "hip") or kernels not in ("torch", "hip"):
             raise ValueError("Use attn_backend='sdpa'/'eager'/'hip' and kernels='torch'/'hip'")
         self.device = resolve_device(device)
         self.dtype = resolve_dtype(dtype, self.device)
+        if quantization != "none" and self.device.type != "cuda":
+            raise ValueError("bitsandbytes quantization requires a real ROCm device")
+        self.quantization = quantization
         if kernels == "hip" and self.device.type != "cuda":
             raise ValueError(
                 "kernels='hip' requires a real RDNA4 GPU; use kernels='torch' for CPU validation"
@@ -119,6 +182,8 @@ class LLM:
         self._closed = False
         self.last_stats: dict[str, float | int] = {}
         self.native_norm_count = 0
+        self._lora_adapters: set[str] = set()
+        self._active_lora_adapter: str | None = None
         self.model_id = (
             str(model)
             if isinstance(model, (str, Path))
@@ -129,6 +194,20 @@ class LLM:
             "trust_remote_code": trust_remote_code,
             "local_files_only": local_files_only,
         }
+        quantization_options: dict = {}
+        if quantization != "none":
+            try:
+                from transformers import BitsAndBytesConfig
+            except ImportError as error:
+                raise RuntimeError(
+                    "bitsandbytes quantization requires Transformers BitsAndBytesConfig "
+                    "and bitsandbytes"
+                ) from error
+            quantization_options["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=quantization == "bitsandbytes-4bit",
+                load_in_8bit=quantization == "bitsandbytes-8bit",
+            )
+            quantization_options["device_map"] = {"": str(self.device)}
         # Loading must create ordinary versioned parameters, even when called
         # from an outer inference-mode scope (important for dispatch profiling).
         with trace_active(), torch.inference_mode(False):
@@ -159,6 +238,7 @@ class LLM:
                     config=config,
                     torch_dtype=self.dtype,
                     attn_implementation=implementation,
+                    **quantization_options,
                     **loading,
                 )
             self._check_quantization(config)
@@ -166,7 +246,38 @@ class LLM:
                 raise NotImplementedError(
                     "This Transformers model does not support the native attention interface"
                 )
-            self.model = loaded.eval().to(device=self.device, dtype=self.dtype)
+            self.model = loaded.eval()
+            if quantization == "none":
+                self.model = self.model.to(device=self.device, dtype=self.dtype)
+            if lora_adapter is not None and quantization != "none":
+                raise NotImplementedError(
+                    "PEFT adapters with bitsandbytes weights are not qualified"
+                )
+            if lora_adapter is not None:
+                try:
+                    from peft import PeftModel
+                except ImportError as error:
+                    raise RuntimeError(
+                        "LoRA adapters require the optional 'peft' package; install PEFT "
+                        "before passing lora_adapter"
+                    ) from error
+                adapter = str(lora_adapter)
+                self.model = PeftModel.from_pretrained(
+                    self.model,
+                    adapter,
+                    adapter_name="default",
+                    is_trainable=False,
+                    local_files_only=local_files_only,
+                ).eval()
+                self._lora_adapters.add("default")
+                self._active_lora_adapter = "default"
+                if merge_lora:
+                    self.model = self.model.merge_and_unload().eval()
+                    self._lora_adapters.clear()
+                    self._active_lora_adapter = None
+                self.model = self.model.to(device=self.device, dtype=self.dtype)
+            elif merge_lora:
+                raise ValueError("merge_lora requires lora_adapter")
             if isinstance(tokenizer, PreTrainedTokenizerBase):
                 self.tokenizer = tokenizer
             else:
@@ -177,6 +288,29 @@ class LLM:
                     raise ValueError("Tokenizer must define a pad token or an EOS token")
                 self.tokenizer.pad_token = self.tokenizer.eos_token
             self.tokenizer.padding_side = "left"
+            self.draft_model: PreTrainedModel | None = None
+            self._num_draft_tokens = num_draft_tokens
+            if draft_model is not None:
+                if isinstance(draft_model, PreTrainedModel):
+                    candidate = draft_model
+                else:
+                    draft_config = AutoConfig.from_pretrained(str(draft_model), **loading)
+                    self._check_quantization(draft_config)
+                    candidate = AutoModelForCausalLM.from_pretrained(
+                        str(draft_model), config=draft_config, torch_dtype=self.dtype, **loading
+                    )
+                self.draft_model = candidate.eval().to(device=self.device, dtype=self.dtype)
+                if isinstance(draft_tokenizer, PreTrainedTokenizerBase):
+                    candidate_tokenizer = draft_tokenizer
+                elif isinstance(draft_model, PreTrainedModel) and draft_tokenizer is None:
+                    candidate_tokenizer = self.tokenizer
+                else:
+                    source = (
+                        str(draft_tokenizer) if draft_tokenizer is not None else str(draft_model)
+                    )
+                    candidate_tokenizer = AutoTokenizer.from_pretrained(source, **loading)
+                if candidate_tokenizer.get_vocab() != self.tokenizer.get_vocab():
+                    raise ValueError("draft_model and target model must use identical tokenizers")
             capacities = [
                 value
                 for value in (
@@ -192,6 +326,22 @@ class LLM:
                     f"max_seq_len={max_seq_len} exceeds the model/tokenizer capacity {capacity}"
                 )
             self._max_seq_len = max_seq_len or capacity
+            self._paged_kv_config: dict | None = None
+            if paged_kv_cache:
+                kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+                head_dim = getattr(
+                    config, "head_dim", config.hidden_size // config.num_attention_heads
+                )
+                self._paged_kv_config = {
+                    "num_hidden_layers": config.num_hidden_layers,
+                    "num_pages": kv_cache_pages,
+                    "page_size": kv_cache_page_size,
+                    "num_key_value_heads": kv_heads,
+                    "head_dim": head_dim,
+                    "dtype": self.dtype,
+                    "device": self.device,
+                    "quantization": kv_cache_quantization,
+                }
             if kernels == "hip":
                 from .kernels import load_kernels
                 from .ops import apply_native_norms
@@ -203,9 +353,39 @@ class LLM:
     def _check_quantization(config) -> None:
         if getattr(config, "quantization_config", None):
             raise NotImplementedError(
-                "Quantized checkpoints are not enabled by the portable backend. Use FP32/FP16/BF16 weights; "
-                "NVIDIA FP4/FP8/bitsandbytes plugins are not ROCm equivalents."
+                "Pre-quantized checkpoints are not enabled by the portable backend. "
+                "Use FP32/FP16/BF16 weights or explicit bitsandbytes loading."
             )
+
+    def load_lora_adapter(
+        self, name: str, adapter: str | Path, *, local_files_only: bool = False
+    ) -> None:
+        """Load a PEFT adapter for serialized per-request selection."""
+        if not name or name in self._lora_adapters:
+            raise ValueError("Adapter name must be new and nonempty")
+        with self._lock:
+            if not self._lora_adapters or not hasattr(self.model, "load_adapter"):
+                raise NotImplementedError("Load an initial lora_adapter before adding adapters")
+            self.model.load_adapter(
+                str(adapter),
+                adapter_name=name,
+                is_trainable=False,
+                local_files_only=local_files_only,
+            )
+            self._lora_adapters.add(name)
+
+    def set_lora_adapter(self, name: str | None) -> None:
+        """Select a loaded adapter; callers must not switch it during an active request."""
+        with self._lock:
+            if name is None:
+                if self._lora_adapters:
+                    self.model.disable_adapter_layers()
+                self._active_lora_adapter = None
+                return
+            if name not in self._lora_adapters:
+                raise ValueError(f"Unknown LoRA adapter {name!r}")
+            self.model.set_adapter(name)
+            self._active_lora_adapter = name
 
     def get_tokenizer(self) -> PreTrainedTokenizerBase:
         return self.tokenizer
@@ -254,22 +434,77 @@ class LLM:
             tensors = {name: tensor.to(self.device) for name, tensor in tensors.items()}
         return tensors, tokens, texts
 
+    def _new_paged_cache(self):
+        if self._paged_kv_config is None:
+            return None
+        from .hf_paged_cache import PagedDynamicCache
+
+        return PagedDynamicCache(**self._paged_kv_config)
+
+    def _speculative_options(self, params: SamplingParams) -> dict:
+        if self.draft_model is None:
+            return {}
+        if params.n != 1 or params.beam_width != 1 or params.guided_choice is not None:
+            raise NotImplementedError(
+                "draft-model decoding requires n=1, beam_width=1, and no guided_choice"
+            )
+        return {
+            "assistant_model": self.draft_model,
+            "num_assistant_tokens": self._num_draft_tokens,
+        }
+
+    def _stopping_criteria(
+        self,
+        strings: list[str],
+        prompt_width: int,
+        minimum: int,
+        cancellation_event: threading.Event | None,
+    ) -> StoppingCriteriaList:
+        criteria: list[StoppingCriteria] = []
+        if strings:
+            criteria.append(_StopStrings(self.tokenizer, strings, prompt_width, minimum))
+        if cancellation_event is not None:
+            criteria.append(_CancellationCriteria(cancellation_event))
+        return StoppingCriteriaList(criteria)
+
+    def _guided_processors(
+        self, params: SamplingParams, prompt_width: int, eos_ids: list[int]
+    ) -> list[LogitsProcessor] | None:
+        if params.guided_choice is None:
+            return None
+        choices = [
+            self.tokenizer.encode(choice, add_special_tokens=False)
+            for choice in params.guided_choice
+        ]
+        if any(not choice for choice in choices):
+            raise ValueError("A guided_choice cannot encode to an empty token sequence")
+        if not eos_ids:
+            raise ValueError("guided_choice requires an EOS token")
+        if any(len(choice) > params.max_tokens for choice in choices):
+            raise ValueError("guided_choice length exceeds max_tokens")
+        return [_ChoiceProcessor(choices, prompt_width, eos_ids)]
+
     def generate(
         self,
         prompts: str | list[str] | list[int] | list[list[int]],
         sampling_params: SamplingParams | None = None,
         *,
         streaming: bool = False,
-    ) -> list[RequestOutput]:
+        cancellation_event: threading.Event | None = None,
+        adapter_name: str | None = None,
+    ) -> list[RequestOutput] | Iterator[StreamOutput]:
         """Generate a batch, preserving prompt order and excluding EOS from token IDs.
 
         Stop strings are excluded from text, but their complete boundary tokens
-        remain in token_ids (a stop string may end inside a subword token).
-        Streaming is intentionally rejected until a compatible streaming API exists.
+        remain in token_ids (a stop string may end inside a subword token). Use
+        :meth:`generate_stream` when one completion must be delivered incrementally.
         """
         if streaming:
-            raise NotImplementedError(
-                "Streaming on ROCm is not implemented; use non-streaming generate"
+            return self.generate_stream(  # type: ignore[arg-type]
+                prompts,
+                sampling_params,
+                cancellation_event=cancellation_event,
+                adapter_name=adapter_name,
             )
         params = sampling_params or SamplingParams()
         if not isinstance(params, SamplingParams):
@@ -285,6 +520,8 @@ class LLM:
         with self._lock, trace_active(), torch.inference_mode():
             if self._closed:
                 raise RuntimeError("LLM has been shut down")
+            if adapter_name is not None:
+                self.set_lora_adapter(adapter_name)
             results: list[RequestOutput] = []
             started = time.perf_counter()
             model_hooks = nullcontext()
@@ -305,12 +542,8 @@ class LLM:
                             f"Prompt plus max_tokens exceeds max_seq_len={self._max_seq_len}"
                         )
                     strings = [params.stop] if isinstance(params.stop, str) else (params.stop or [])
-                    stopping = (
-                        StoppingCriteriaList(
-                            [_StopStrings(self.tokenizer, strings, width, params.min_tokens)]
-                        )
-                        if strings
-                        else StoppingCriteriaList()
+                    stopping = self._stopping_criteria(
+                        strings, width, params.min_tokens, cancellation_event
                     )
                     do_sample = params.temperature > 0
                     end_id = (
@@ -331,6 +564,7 @@ class LLM:
                     )
                     if any(token >= vocabulary_size for token in [pad_id, *eos_ids]):
                         raise ValueError("EOS/pad token ID is outside the model vocabulary")
+                    processors = self._guided_processors(params, width, eos_ids)
                     options = {
                         "max_new_tokens": params.max_tokens,
                         "min_new_tokens": params.min_tokens,
@@ -344,6 +578,12 @@ class LLM:
                         "use_cache": True,
                         "return_dict_in_generate": False,
                     }
+                    options.update(self._speculative_options(params))
+                    paged_cache = self._new_paged_cache()
+                    if paged_cache is not None:
+                        options["past_key_values"] = paged_cache
+                    if processors:
+                        options["logits_processor"] = processors
                     if do_sample:
                         options.update(
                             temperature=params.temperature, top_p=params.top_p, top_k=params.top_k
@@ -378,6 +618,8 @@ class LLM:
                                 if endings:
                                     tokens = tokens[: endings[0]]
                                     reason = "stop"
+                            if cancellation_event is not None and cancellation_event.is_set():
+                                reason = "cancelled"
                             output_text = self.tokenizer.decode(tokens, skip_special_tokens=True)
                             stop_positions = [
                                 output_text.find(stop) for stop in strings if stop in output_text
@@ -403,6 +645,190 @@ class LLM:
                 "tokens_per_s": output_tokens / elapsed if elapsed else 0.0,
             }
             return results
+
+    def generate_stream(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams | None = None,
+        *,
+        cancellation_event: threading.Event | None = None,
+        adapter_name: str | None = None,
+    ) -> Iterator[StreamOutput]:
+        """Generate one completion as lossless text deltas.
+
+        This is the portable streaming counterpart to :meth:`generate`. It uses
+        Transformers' streamer rather than a CUDA-only executor, so it works on
+        CPU reference mode and HIP. Streaming one sequence is intentional:
+        Transformers' text streamer does not preserve per-request ordering for
+        a batch, beam search, or multiple returned sequences. Those modes remain
+        available through the non-streaming ``generate`` API.
+
+        Stop strings are withheld until they are known not to be the start of a
+        configured stop sequence. The terminal item has an empty ``text`` field,
+        a finish reason, and exact generated token IDs.
+        """
+        params = sampling_params or SamplingParams()
+        if not isinstance(params, SamplingParams):
+            raise TypeError("Use tensorrt_llm.rocm.SamplingParams with the ROCm backend")
+        if params.n != 1 or params.beam_width != 1:
+            raise NotImplementedError(
+                "Streaming supports one completion with beam_width=1; use non-streaming generate"
+            )
+        if self.draft_model is not None:
+            raise NotImplementedError("Streaming with a draft model is not qualified yet")
+        if not isinstance(prompt, str) and not (
+            isinstance(prompt, list)
+            and prompt
+            and all(isinstance(token, int) and not isinstance(token, bool) for token in prompt)
+        ):
+            raise TypeError("Streaming prompt must be text or one nonempty list of token IDs")
+
+        # Tokenizer decoding is stateful at word boundaries; TextIteratorStreamer
+        # preserves that state and supplies deltas suitable for SSE output.
+        streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+        request_id = next(self._ids)
+        state: dict[str, object] = {}
+
+        def _run() -> None:
+            try:
+                with self._lock, trace_active(), torch.inference_mode():
+                    if self._closed:
+                        raise RuntimeError("LLM has been shut down")
+                    if adapter_name is not None:
+                        self.set_lora_adapter(adapter_name)
+                    started = time.perf_counter()
+                    encoded, prompt_ids, _ = self._encode([prompt])
+                    width = encoded["input_ids"].shape[1]
+                    if (
+                        self._max_seq_len is not None
+                        and width + params.max_tokens > self._max_seq_len
+                    ):
+                        raise ValueError(
+                            f"Prompt plus max_tokens exceeds max_seq_len={self._max_seq_len}"
+                        )
+                    strings = (
+                        [params.stop] if isinstance(params.stop, str) else (params.stop or [])
+                    )
+                    stopping = self._stopping_criteria(
+                        strings, width, params.min_tokens, cancellation_event
+                    )
+                    end_id = (
+                        params.end_id
+                        if params.end_id is not None
+                        else self.model.generation_config.eos_token_id
+                    )
+                    if end_id is None:
+                        end_id = self.tokenizer.eos_token_id
+                    pad_id = (
+                        params.pad_id
+                        if params.pad_id is not None
+                        else self.tokenizer.pad_token_id
+                    )
+                    vocabulary_size = self.model.get_input_embeddings().num_embeddings
+                    eos_ids = (
+                        end_id
+                        if isinstance(end_id, list)
+                        else ([end_id] if end_id is not None else [])
+                    )
+                    if any(token >= vocabulary_size for token in [pad_id, *eos_ids]):
+                        raise ValueError("EOS/pad token ID is outside the model vocabulary")
+                    processors = self._guided_processors(params, width, eos_ids)
+                    options = {
+                        "max_new_tokens": params.max_tokens,
+                        "min_new_tokens": params.min_tokens,
+                        "do_sample": params.temperature > 0,
+                        "repetition_penalty": params.repetition_penalty,
+                        "pad_token_id": pad_id,
+                        "eos_token_id": None if params.ignore_eos else end_id,
+                        "stopping_criteria": stopping,
+                        "streamer": streamer,
+                        "use_cache": True,
+                        "return_dict_in_generate": False,
+                    }
+                    paged_cache = self._new_paged_cache()
+                    if paged_cache is not None:
+                        options["past_key_values"] = paged_cache
+                    if processors:
+                        options["logits_processor"] = processors
+                    if params.temperature > 0:
+                        options.update(
+                            temperature=params.temperature,
+                            top_p=params.top_p,
+                            top_k=params.top_k,
+                        )
+                    rng = (
+                        torch.random.fork_rng(
+                            devices=[self.device.index] if self.device.type == "cuda" else []
+                        )
+                        if params.seed is not None
+                        else nullcontext()
+                    )
+                    with rng:
+                        if params.seed is not None:
+                            torch.random.default_generator.manual_seed(params.seed)
+                            if self.device.type == "cuda":
+                                with torch.cuda.device(self.device):
+                                    torch.cuda.manual_seed(params.seed)
+                        generated = self.model.generate(**encoded, **options)
+                    tokens = generated[0, width:].cpu().tolist()
+                    finish_reason = "length"
+                    if not params.ignore_eos:
+                        endings = [
+                            position for position, token in enumerate(tokens) if token in eos_ids
+                        ]
+                        if endings:
+                            tokens = tokens[: endings[0]]
+                            finish_reason = "stop"
+                    if cancellation_event is not None and cancellation_event.is_set():
+                        finish_reason = "cancelled"
+                    elapsed = time.perf_counter() - started
+                    self.last_stats = {
+                        "wall_s": elapsed,
+                        "input_tokens": len(prompt_ids[0]),
+                        "output_tokens": len(tokens),
+                        "tokens_per_s": len(tokens) / elapsed if elapsed else 0.0,
+                    }
+                    state.update(tokens=tokens, finish_reason=finish_reason)
+            except BaseException as error:
+                # A generator exception would otherwise leave the consumer
+                # blocked forever waiting for TextIteratorStreamer's sentinel.
+                state["error"] = error
+                streamer.on_finalized_text("", stream_end=True)
+
+        thread = threading.Thread(target=_run, name="trtllm-rocm-stream", daemon=True)
+        thread.start()
+        pending = ""
+        stopped_by_string = False
+        strings = [params.stop] if isinstance(params.stop, str) else (params.stop or [])
+        holdback = max((len(string) - 1 for string in strings), default=0)
+        try:
+            for delta in streamer:
+                candidate = pending + delta
+                stops = [candidate.find(string) for string in strings if string in candidate]
+                if stops:
+                    text = candidate[: min(stops)]
+                    pending = ""
+                    stopped_by_string = True
+                elif holdback:
+                    split = max(0, len(candidate) - holdback)
+                    text, pending = candidate[:split], candidate[split:]
+                else:
+                    text, pending = candidate, ""
+                if text:
+                    yield StreamOutput(request_id=request_id, text=text)
+        finally:
+            thread.join()
+        if "error" in state:
+            raise state["error"]  # type: ignore[misc]
+        if pending and not stopped_by_string:
+            yield StreamOutput(request_id=request_id, text=pending)
+        finish_reason = "stop" if stopped_by_string else state["finish_reason"]
+        yield StreamOutput(
+            request_id=request_id,
+            text="",
+            finish_reason=finish_reason,  # type: ignore[arg-type]
+            token_ids=state["tokens"],  # type: ignore[arg-type]
+        )
 
     def shutdown(self) -> None:
         """Release model references; do not clear another application's GPU allocator."""

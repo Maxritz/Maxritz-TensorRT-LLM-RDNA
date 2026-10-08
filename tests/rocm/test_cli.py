@@ -65,10 +65,29 @@ def test_generate_and_serial_benchmark_from_local_checkpoint(checkpoint, tmp_pat
     assert report["output_tokens_per_s"] > 0
 
 
+def test_embed_from_local_checkpoint(checkpoint, capsys) -> None:
+    main(
+        [
+            "embed",
+            "--model",
+            str(checkpoint),
+            "--device",
+            "cpu",
+            "--local-files-only",
+            "--input",
+            "tok4 tok5",
+        ]
+    )
+    response = json.loads(capsys.readouterr().out)
+    assert response["object"] == "list" and len(response["data"]) == 1
+    assert response["usage"]["total_tokens"] == 2
+
+
 def test_doctor_allows_explicit_cpu_inspection(capsys) -> None:
     main(["doctor", "--allow-cpu"])
     report = json.loads(capsys.readouterr().out)
     assert "supported_architectures" in report
+    assert "optional_capabilities" in report and "peft" in report["optional_capabilities"]
 
 
 def test_generate_rejects_missing_model_and_profile_modifiers() -> None:

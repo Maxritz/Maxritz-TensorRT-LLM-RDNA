@@ -237,6 +237,31 @@ def validate(
             full_cpu.logits[:, -1:],
             torch.float32,
         )
+        paged_cache = gpu._new_paged_cache()
+        if paged_cache is not None:
+            raise AssertionError("Validation GPU engine must not construct a paged cache by default")
+        from .hf_paged_cache import PagedDynamicCache
+
+        page_cache = PagedDynamicCache(
+            num_hidden_layers=reference.config.num_hidden_layers,
+            num_pages=32,
+            page_size=2,
+            num_key_value_heads=reference.config.num_key_value_heads,
+            head_dim=reference.config.hidden_size // reference.config.num_attention_heads,
+            dtype=torch.float32,
+            device=target,
+        )
+        paged_prefill = gpu.model(
+            input_ids=ids.to(target), past_key_values=page_cache, use_cache=True
+        )
+        paged_decode = gpu.model(
+            input_ids=next_ids.to(target),
+            attention_mask=mask.to(target),
+            past_key_values=page_cache,
+            use_cache=True,
+        )
+        compare("llm/paged-cache-prefill-logits", paged_prefill.logits, prefill_gpu.logits, torch.float32)
+        compare("llm/paged-cache-decode-logits", paged_decode.logits, decode_gpu.logits, torch.float32)
         params = SamplingParams(temperature=0, max_tokens=8, ignore_eos=True)
         prompts = ["tok4 tok5 tok6", "tok7 tok8"]
         expected = cpu.generate(prompts, params)
