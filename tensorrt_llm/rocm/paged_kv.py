@@ -96,6 +96,12 @@ class PagedKVCache:
             self._retain(page)
         return PagedSequence(list(cached.page_ids), cached.length)
 
+    def clone(self, sequence: PagedSequence) -> PagedSequence:
+        """Retain page references for a beam/cache branch."""
+        for page in sequence.page_ids:
+            self._retain(page)
+        return PagedSequence(list(sequence.page_ids), sequence.length)
+
     def release(self, sequence: PagedSequence) -> None:
         for page in sequence.page_ids:
             self._release(page)
@@ -167,6 +173,24 @@ class PagedKVCache:
         value = source.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127
         destination.copy_(torch.round(source.float() / value).clamp_(-127, 127).to(torch.int8))
         scale.copy_(value)
+
+    def page_table(self, sequences: list[PagedSequence]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return device page IDs and logical lengths for paged decode kernels."""
+        if not sequences:
+            raise ValueError("page_table requires at least one sequence")
+        width = max(len(sequence.page_ids) for sequence in sequences)
+        table = torch.full(
+            (len(sequences), width), -1, dtype=torch.int32, device=self.keys.device
+        )
+        for row, sequence in enumerate(sequences):
+            if sequence.page_ids:
+                table[row, : len(sequence.page_ids)] = torch.tensor(
+                    sequence.page_ids, dtype=torch.int32, device=self.keys.device
+                )
+        lengths = torch.tensor(
+            [sequence.length for sequence in sequences], dtype=torch.int32, device=self.keys.device
+        )
+        return table, lengths
 
     def materialize(self, sequence: PagedSequence) -> tuple[torch.Tensor, torch.Tensor]:
         """Return contiguous `[layers, tokens, heads, dim]` tensors for a backend adapter."""

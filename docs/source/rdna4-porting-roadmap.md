@@ -51,7 +51,7 @@ dependency.
 | Dense MHA/MQA/GQA attention | SDPA/eager plus small native HIP kernel | Default PyTorch SDPA/AOTriton; optional RDNA AITER FlashAttention | P1 kernel path |
 | Flash attention / FMHA / FlashInfer | **Not ported** | AITER gfx1201 FlyDSL flash-attention kernel; AOTriton/PyTorch SDPA fallback | P1, target GPU qualification |
 | MLA, sparse/skip-softmax attention | **Not ported** | AITER/vLLM ROCm implementations are reference material; port only algorithms with a native RDNA4 path | P4; model-specific |
-| Paged attention and paged KV manager | **Partial** | `PagedKVCache` has page allocation/refcount/COW prefix sharing and `paged_attention` provides a portable HIP/PyTorch execution fallback; a fused RDNA decode kernel and HF cache adapter remain | P1 scheduler + P2 kernel |
+| Paged attention and paged KV manager | **Partial** | `PagedDynamicCache` wires `PagedKVCache` into the Transformers cache contract; `paged_attention` is the portable execution fallback and `triton_paged_decode` is an opt-in RDNA qualification kernel | P1 scheduler + P2 kernel |
 | Prefix cache / prefix tokenization cache | **Not ported** | Token-ID prefix trie first, then page-level KV sharing after paged cache exists | P2; depends on paged KV |
 | Chunked prefill, IFB, request scheduling, overlap scheduler | **Partial** | `ContinuousBatchScheduler` now defines admission and token-step decode rounds over live page-table requests; an HF cache adapter must supply its prefill/decode callbacks before serving integration | P1; must precede throughput claims |
 | CUDA graphs / piecewise graphs | **Not ported** | Qualify PyTorch `torch.cuda.CUDAGraph` under HIP and call the result a HIP graph | P3; fixed-shape scheduler required |
@@ -60,7 +60,7 @@ dependency.
 | Guided decoding (JSON, regex, grammar, structural tags) | **Partial** | Portable exact `guided_choice` token-prefix mask is implemented; JSON/regex/grammar require an Outlines constraint adapter and tokenizer qualification | P2; portable sampler required |
 | Streaming, OpenAI SSE | **Implemented, constrained** | Transformers `TextIteratorStreamer` and SSE adapter | P0 complete; GPU qualification still required |
 | AsyncLLM, cancellation, backpressure | **Partial** | `AsyncLLM` has a bounded serialized queue and async stream bridge; queued cancellation works, while active model cancellation still needs scheduler/request lifecycle support in the generation loop | P1 |
-| LoRA / multi-LoRA and adapter cache | **Partial** | Optional PEFT single-adapter load/optional merge is implemented; add an adapter registry and batched fused LoRA only after the scheduler/GEMM path | P2 then P4 |
+| LoRA / multi-LoRA and adapter cache | **Partial** | PEFT adapter loading/routing plus `grouped_lora_linear` adapter-grouped ROCm GEMM correctness path are available; model-wide PEFT module replacement and a fused kernel remain | P2 then P4 |
 | Quantized weights, quantized KV, ModelOpt formats | **Partial** | Explicit bitsandbytes 4/8-bit HF loading is available behind a real ROCm-device dependency; quantized KV, ModelOpt formats, accuracy and performance gates remain | P2, each format needs accuracy/perf gates |
 | KV cache compression/offload | **Partial** | `PagedKVCache(quantization="int8")` stores per-token/head scaled INT8 K/V and dequantizes at portable attention dispatch; host offload, NVFP4 and fused quantized decode remain | P4 |
 | Speculative decoding (draft/target, n-gram, EAGLE, MTP, PARD, DFlash) | **Partial** | HF assisted draft/target generation is available for non-streaming `n=1`/beam-1 requests; scheduler-aware acceptance kernels and advanced variants remain | P3, requires paged KV + logprobs |
@@ -68,7 +68,7 @@ dependency.
 | Multimodal LLM | **Not ported** | Transformers processor/model path, then batched vision encoder scheduling | P3, per-model qualification |
 | Visual generation, quantized/sparse VisualGen, VisualGen graph | **Not ported** | Separate Diffusers/ROCm pipeline; NVIDIA CUTEDSL/FlashInfer code cannot be transplanted | P5 |
 | MoE routing / fused MoE | **Not ported** | Dense/eager correctness baseline, then AITER RDNA-compatible GEMM/router kernels | P4; target-specific |
-| Tensor/pipeline/data/context/expert/Helix parallelism | **Not ported** | PyTorch distributed backed by RCCL; introduce TP before PP/EP/CP | P4; multi-GPU RDNA4 lab needed |
+| Tensor/pipeline/data/context/expert/Helix parallelism | **Partial** | RCCL context plus column/row-parallel linear primitives are implemented; model-family weight replacement and multi-GPU RDNA4 qualification remain | P4; multi-GPU RDNA4 lab needed |
 | Disaggregated serving / KV connectors / NIXL/Mooncake | **Not ported** | Begin with a host-copy reference transport; evaluate RCCL point-to-point and Iris only after ownership/lifetime tests | P5 |
 | Ray orchestration, sub-agent routing, post-processor hooks | **Not ported** | Keep these backend-neutral at the HTTP/request layer | P3/P5 depending on scheduler |
 | Evaluation CLI | **Not ported** | Adapter to `lm-evaluation-harness`; verify offline/local model behavior | P2 |

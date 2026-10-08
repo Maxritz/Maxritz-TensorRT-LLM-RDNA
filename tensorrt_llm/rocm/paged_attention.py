@@ -27,6 +27,7 @@ def paged_attention(
     query_start: int | list[int] | None = None,
     scale: float | None = None,
     backend: KernelBackend = "torch",
+    implementation: str = "portable",
 ) -> torch.Tensor:
     """Attend `[batch, query_heads, query_tokens, dim]` over paged K/V storage.
 
@@ -37,6 +38,8 @@ def paged_attention(
     """
     if query.ndim != 4 or query.shape[0] != len(sequences):
         raise ValueError("query batch dimension must equal the number of paged sequences")
+    if implementation not in ("portable", "triton"):
+        raise ValueError("implementation must be portable or triton")
     if not 0 <= layer < cache.num_layers:
         raise ValueError("layer is outside this paged KV cache")
     if query.dtype != cache.dtype or query.device != cache.keys.device:
@@ -48,6 +51,17 @@ def paged_attention(
         if len(query_start) != len(sequences):
             raise ValueError("query_start must have one value per sequence")
         starts = list(query_start)
+    if implementation == "triton":
+        if query.shape[2] != 1 or not causal or any(start is not None for start in starts):
+            raise NotImplementedError("Triton paged decode supports one right-aligned causal query")
+        if cache.quantization != "none":
+            raise NotImplementedError("Triton paged decode does not yet support INT8 KV pages")
+        from .triton_paged_decode import triton_paged_decode
+
+        table, lengths = cache.page_table(sequences)
+        return triton_paged_decode(
+            query[:, :, 0], cache.keys[layer], cache.values[layer], table, lengths, scale=scale
+        ).unsqueeze(2)
     outputs = []
     for row, (sequence, start) in enumerate(zip(sequences, starts)):
         if sequence.length < 1:

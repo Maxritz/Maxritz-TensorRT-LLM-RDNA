@@ -137,6 +137,10 @@ class LLM:
         draft_model: str | Path | PreTrainedModel | None = None,
         draft_tokenizer: str | Path | PreTrainedTokenizerBase | None = None,
         num_draft_tokens: int = 4,
+        paged_kv_cache: bool = False,
+        kv_cache_pages: int = 1024,
+        kv_cache_page_size: int = 16,
+        kv_cache_quantization: Literal["none", "int8"] = "none",
         lora_adapter: str | Path | None = None,
         merge_lora: bool = False,
         tensor_parallel_size: int = 1,
@@ -153,6 +157,10 @@ class LLM:
             raise ValueError("max_batch_size and max_seq_len must be positive")
         if num_draft_tokens < 1:
             raise ValueError("num_draft_tokens must be positive")
+        if kv_cache_pages < 1 or kv_cache_page_size < 1:
+            raise ValueError("kv_cache_pages and kv_cache_page_size must be positive")
+        if kv_cache_quantization not in ("none", "int8"):
+            raise ValueError("kv_cache_quantization must be none or int8")
         if quantization not in ("none", "bitsandbytes-4bit", "bitsandbytes-8bit"):
             raise ValueError("Unsupported quantization mode")
         if attn_backend not in ("sdpa", "eager", "hip") or kernels not in ("torch", "hip"):
@@ -318,6 +326,22 @@ class LLM:
                     f"max_seq_len={max_seq_len} exceeds the model/tokenizer capacity {capacity}"
                 )
             self._max_seq_len = max_seq_len or capacity
+            self._paged_kv_config: dict | None = None
+            if paged_kv_cache:
+                kv_heads = getattr(config, "num_key_value_heads", config.num_attention_heads)
+                head_dim = getattr(
+                    config, "head_dim", config.hidden_size // config.num_attention_heads
+                )
+                self._paged_kv_config = {
+                    "num_hidden_layers": config.num_hidden_layers,
+                    "num_pages": kv_cache_pages,
+                    "page_size": kv_cache_page_size,
+                    "num_key_value_heads": kv_heads,
+                    "head_dim": head_dim,
+                    "dtype": self.dtype,
+                    "device": self.device,
+                    "quantization": kv_cache_quantization,
+                }
             if kernels == "hip":
                 from .kernels import load_kernels
                 from .ops import apply_native_norms
@@ -409,6 +433,13 @@ class LLM:
         with component("transfer"):
             tensors = {name: tensor.to(self.device) for name, tensor in tensors.items()}
         return tensors, tokens, texts
+
+    def _new_paged_cache(self):
+        if self._paged_kv_config is None:
+            return None
+        from .hf_paged_cache import PagedDynamicCache
+
+        return PagedDynamicCache(**self._paged_kv_config)
 
     def _speculative_options(self, params: SamplingParams) -> dict:
         if self.draft_model is None:
@@ -548,6 +579,9 @@ class LLM:
                         "return_dict_in_generate": False,
                     }
                     options.update(self._speculative_options(params))
+                    paged_cache = self._new_paged_cache()
+                    if paged_cache is not None:
+                        options["past_key_values"] = paged_cache
                     if processors:
                         options["logits_processor"] = processors
                     if do_sample:
@@ -711,6 +745,9 @@ class LLM:
                         "use_cache": True,
                         "return_dict_in_generate": False,
                     }
+                    paged_cache = self._new_paged_cache()
+                    if paged_cache is not None:
+                        options["past_key_values"] = paged_cache
                     if processors:
                         options["logits_processor"] = processors
                     if params.temperature > 0:

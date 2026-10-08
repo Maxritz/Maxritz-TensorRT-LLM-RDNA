@@ -54,10 +54,16 @@ def _model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--attn-backend", choices=("sdpa", "eager", "hip"), default="sdpa")
     parser.add_argument("--max-batch-size", type=_positive, default=1)
     parser.add_argument("--max-seq-len", type=_positive)
+    parser.add_argument("--paged-kv-cache", action="store_true")
+    parser.add_argument("--kv-cache-pages", type=_positive, default=1024)
+    parser.add_argument("--kv-cache-page-size", type=_positive, default=16)
+    parser.add_argument("--kv-cache-quantization", choices=("none", "int8"), default="none")
     parser.add_argument("--revision")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
-    parser.add_argument("--draft-model", help="HF draft checkpoint for assisted speculative decoding")
+    parser.add_argument(
+        "--draft-model", help="HF draft checkpoint for assisted speculative decoding"
+    )
     parser.add_argument("--draft-tokenizer", help="Draft tokenizer, if distinct from --tokenizer")
     parser.add_argument("--num-draft-tokens", type=_positive, default=4)
     parser.add_argument("--lora-adapter", help="Static PEFT LoRA adapter path or model ID")
@@ -110,6 +116,10 @@ def _llm(options: argparse.Namespace):
         draft_model=options.draft_model,
         draft_tokenizer=options.draft_tokenizer,
         num_draft_tokens=options.num_draft_tokens,
+        paged_kv_cache=options.paged_kv_cache,
+        kv_cache_pages=options.kv_cache_pages,
+        kv_cache_page_size=options.kv_cache_page_size,
+        kv_cache_quantization=options.kv_cache_quantization,
         lora_adapter=options.lora_adapter,
         merge_lora=options.merge_lora,
     )
@@ -229,7 +239,9 @@ def _embedding_llm(options: argparse.Namespace):
             "Static PEFT adapters are currently available for causal generation only"
         )
     if options.quantization != "none":
-        raise NotImplementedError("bitsandbytes loading is currently available for causal models only")
+        raise NotImplementedError(
+            "bitsandbytes loading is currently available for causal models only"
+        )
     return EmbeddingLLM(
         model=model,
         tokenizer=options.tokenizer,
