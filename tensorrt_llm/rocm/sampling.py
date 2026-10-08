@@ -92,4 +92,20 @@ class RequestOutput:
     finished: bool = True
 
 
-__all__ = ["SamplingParams", "CompletionOutput", "RequestOutput"]
+@dataclass
+class StreamOutput:
+    """One lossless text delta from :meth:`LLM.generate_stream`.
+
+    ``token_ids`` is populated only on the terminal item, where it contains the
+    final completion IDs with a terminal EOS removed. This keeps streaming
+    output inexpensive while preserving exact token accounting once generation
+    has completed.
+    """
+
+    request_id: int
+    text: str
+    finish_reason: Literal["stop", "length"] | None = None
+    token_ids: list[int] | None = None
+
+
+__all__ = ["SamplingParams", "CompletionOutput", "RequestOutput", "StreamOutput"]

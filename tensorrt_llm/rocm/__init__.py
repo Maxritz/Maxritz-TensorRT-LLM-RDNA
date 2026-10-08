@@ -16,9 +16,9 @@
 
 import importlib
 
-from .sampling import CompletionOutput, RequestOutput, SamplingParams
+from .sampling import CompletionOutput, RequestOutput, SamplingParams, StreamOutput
 
-__all__ = ["LLM", "SamplingParams", "CompletionOutput", "RequestOutput"]
+__all__ = ["LLM", "SamplingParams", "CompletionOutput", "RequestOutput", "StreamOutput"]
 
 
 def __getattr__(name: str):

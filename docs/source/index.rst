@@ -19,6 +19,7 @@ Welcome to TensorRT LLM's Documentation!
    installation/index.rst
    supported-hardware.md
    rocm-rdna4.md
+   rdna4-porting-roadmap.md
 
 
 .. toctree::

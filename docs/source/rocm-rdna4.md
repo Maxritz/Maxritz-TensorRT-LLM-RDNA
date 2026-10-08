@@ -25,11 +25,11 @@ claim of complete NVIDIA feature parity.
 | Native model integration | `kernels="hip"` replaces compatible Llama/Mistral/Qwen2/Qwen3/Phi3 RMSNorms and affine 1D LayerNorms. `attn_backend="hip"` additionally uses native attention for Llama/Mistral/Qwen2/Qwen3 with head dimensions ≤256. |
 | Rotary / gating primitives | Available through `tensorrt_llm.rocm.ops`; not automatically substituted into every HF model implementation. |
 | Sampling | Greedy, temperature/top-p/top-k, repetition penalty, seed, multiple completions, HF beam search, EOS and decoded stop strings. No logprob materialization. |
-| Serving | Non-streaming OpenAI-compatible completions/chat, health and model discovery. Generation is serialized; this is not an in-flight batching scheduler. |
+| Serving | OpenAI-compatible completions/chat, health and model discovery. Single-prompt `stream=true` uses server-sent events on CPU/HIP; `n=1` and `beam_width=1` are required. Generation is serialized; this is not an in-flight batching scheduler. |
 | Benchmarks | Real serial latency/throughput, excluding warmup; includes tokenization, transfers, generation and detokenization. Not TTFT or streaming token latency. |
 | Profiling | Sherlock-style component table, per-file/function host data, HIP/CUDA event spans, CPU/RAM/GPU/VRAM sampling, JSON/text/Chrome/cProfile outputs. |
 | CPU mode | Explicit `device="cpu"` reference/testing mode, FP32 by default. It is never a fallback for an unavailable GPU. Half-precision model execution depends on your CPU PyTorch build. |
-| Not ported | TensorRT plans/plugins/builders; CUDA graphs; FlashInfer/CUTLASS/PTX/CDNA-specific fused code; quantized engines; tensor/pipeline/expert parallelism; RCCL/disaggregated cache exchange; paged/native KV manager; speculative decoding; LoRA; VisualGen/multimodal; upstream AsyncLLM, streaming, guided decoding and evaluation CLI. Unsupported options fail rather than being silently ignored. |
+| Not ported | TensorRT plans/plugins/builders; CUDA graphs; FlashInfer/CUTLASS/PTX/CDNA-specific fused code; quantized engines; tensor/pipeline/expert parallelism; RCCL/disaggregated cache exchange; paged/native KV manager; speculative decoding; LoRA; VisualGen/multimodal; upstream AsyncLLM, guided decoding and evaluation CLI. Unsupported options fail rather than being silently ignored. See the [porting backlog](rdna4-porting-roadmap.md) for the feature-by-feature replacement plan. |
 
 Models must fit in the selected device's VRAM. An HF model relying on custom CUDA
 extensions or unsupported SDPA is not made portable merely by loading its weights.
@@ -173,7 +173,9 @@ trtllm-bench --model /path/to/hf-checkpoint throughput --local-files-only \
 ```
 
 Endpoints: `/health`, `/v1/models`, `/v1/completions`, `/v1/chat/completions`.
-Chat requires a tokenizer chat template. Unknown request fields, streaming and
+Chat requires a tokenizer chat template. `stream=true` emits OpenAI-style SSE for
+one completion (`n=1`, `beam_width=1`); batch, beam and multi-completion streams
+are rejected instead of being interleaved ambiguously. Unknown request fields and
 unsupported sampling/logprob features are rejected. The server binds to loopback
 (`127.0.0.1`) by default; use `--host 0.0.0.0` only when external access is intended.
 It has no TLS and no

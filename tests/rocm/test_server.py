@@ -16,6 +16,7 @@
 import pytest
 from fastapi.testclient import TestClient
 
+from tensorrt_llm.rocm.sampling import StreamOutput
 from tensorrt_llm.rocm.server import create_app
 
 pytestmark = pytest.mark.cpu_only
@@ -53,13 +54,41 @@ def test_health_models_text_and_chat(engine, monkeypatch) -> None:
         assert chat.json()["choices"][0]["message"]["role"] == "assistant"
 
 
-def test_server_rejects_streaming_wrong_models_and_unknown_options(engine, monkeypatch) -> None:
+def test_server_streaming_wrong_models_and_unknown_options(engine, monkeypatch) -> None:
     monkeypatch.delenv("TRTLLM_API_KEY", raising=False)
+
+    def fake_stream(_prompt, _params):
+        yield StreamOutput(request_id=1, text="hel")
+        yield StreamOutput(request_id=1, text="lo")
+        yield StreamOutput(request_id=1, text="", finish_reason="stop", token_ids=[4, 5])
+
+    monkeypatch.setattr(engine, "generate_stream", fake_stream)
     with TestClient(create_app(engine, "tiny")) as client:
+        stream = client.post(
+            "/v1/completions",
+            json={"model": "tiny", "prompt": "tok4", "stream": True, "temperature": 0},
+        )
+        assert stream.status_code == 200, stream.text
+        assert stream.headers["content-type"].startswith("text/event-stream")
+        assert '"text":"hel"' in stream.text
+        assert '"finish_reason":"stop"' in stream.text
+        assert stream.text.rstrip().endswith("data: [DONE]")
+        chat = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "tiny",
+                "messages": [{"role": "user", "content": "tok4"}],
+                "stream": True,
+            },
+        )
+        assert chat.status_code == 200, chat.text
+        assert '"role":"assistant"' in chat.text
+        assert '"content":"hel"' in chat.text
         for values, status in (
             ({"model": "other"}, 404),
-            ({"stream": True}, 400),
             ({"logprobs": 3}, 422),
+            ({"stream": True, "n": 2}, 400),
+            ({"stream": True, "prompt": ["tok4", "tok5"]}, 400),
         ):
             response = client.post(
                 "/v1/completions", json={"model": "tiny", "prompt": "tok4", **values}

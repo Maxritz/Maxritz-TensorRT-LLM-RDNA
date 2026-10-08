@@ -21,7 +21,7 @@ import threading
 import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Literal
+from typing import Iterator, Literal
 
 import torch
 from transformers import (
@@ -32,12 +32,13 @@ from transformers import (
     PreTrainedTokenizerBase,
     StoppingCriteria,
     StoppingCriteriaList,
+    TextIteratorStreamer,
 )
 
 from trtllm_profile import active_session, component, trace_active
 
 from .runtime import KernelBackend, resolve_device, resolve_dtype
-from .sampling import CompletionOutput, RequestOutput, SamplingParams
+from .sampling import CompletionOutput, RequestOutput, SamplingParams, StreamOutput
 
 
 class _StopStrings(StoppingCriteria):
@@ -260,17 +261,15 @@ class LLM:
         sampling_params: SamplingParams | None = None,
         *,
         streaming: bool = False,
-    ) -> list[RequestOutput]:
+    ) -> list[RequestOutput] | Iterator[StreamOutput]:
         """Generate a batch, preserving prompt order and excluding EOS from token IDs.
 
         Stop strings are excluded from text, but their complete boundary tokens
-        remain in token_ids (a stop string may end inside a subword token).
-        Streaming is intentionally rejected until a compatible streaming API exists.
+        remain in token_ids (a stop string may end inside a subword token). Use
+        :meth:`generate_stream` when one completion must be delivered incrementally.
         """
         if streaming:
-            raise NotImplementedError(
-                "Streaming on ROCm is not implemented; use non-streaming generate"
-            )
+            return self.generate_stream(prompts, sampling_params)  # type: ignore[arg-type]
         params = sampling_params or SamplingParams()
         if not isinstance(params, SamplingParams):
             raise TypeError("Use tensorrt_llm.rocm.SamplingParams with the ROCm backend")
@@ -403,6 +402,179 @@ class LLM:
                 "tokens_per_s": output_tokens / elapsed if elapsed else 0.0,
             }
             return results
+
+    def generate_stream(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams | None = None,
+    ) -> Iterator[StreamOutput]:
+        """Generate one completion as lossless text deltas.
+
+        This is the portable streaming counterpart to :meth:`generate`. It uses
+        Transformers' streamer rather than a CUDA-only executor, so it works on
+        CPU reference mode and HIP. Streaming one sequence is intentional:
+        Transformers' text streamer does not preserve per-request ordering for
+        a batch, beam search, or multiple returned sequences. Those modes remain
+        available through the non-streaming ``generate`` API.
+
+        Stop strings are withheld until they are known not to be the start of a
+        configured stop sequence. The terminal item has an empty ``text`` field,
+        a finish reason, and exact generated token IDs.
+        """
+        params = sampling_params or SamplingParams()
+        if not isinstance(params, SamplingParams):
+            raise TypeError("Use tensorrt_llm.rocm.SamplingParams with the ROCm backend")
+        if params.n != 1 or params.beam_width != 1:
+            raise NotImplementedError(
+                "Streaming supports one completion with beam_width=1; use non-streaming generate"
+            )
+        if not isinstance(prompt, str) and not (
+            isinstance(prompt, list)
+            and prompt
+            and all(isinstance(token, int) and not isinstance(token, bool) for token in prompt)
+        ):
+            raise TypeError("Streaming prompt must be text or one nonempty list of token IDs")
+
+        # Tokenizer decoding is stateful at word boundaries; TextIteratorStreamer
+        # preserves that state and supplies deltas suitable for SSE output.
+        streamer = TextIteratorStreamer(self.tokenizer, skip_prompt=True, skip_special_tokens=True)
+        request_id = next(self._ids)
+        state: dict[str, object] = {}
+
+        def _run() -> None:
+            try:
+                with self._lock, trace_active(), torch.inference_mode():
+                    if self._closed:
+                        raise RuntimeError("LLM has been shut down")
+                    started = time.perf_counter()
+                    encoded, prompt_ids, _ = self._encode([prompt])
+                    width = encoded["input_ids"].shape[1]
+                    if (
+                        self._max_seq_len is not None
+                        and width + params.max_tokens > self._max_seq_len
+                    ):
+                        raise ValueError(
+                            f"Prompt plus max_tokens exceeds max_seq_len={self._max_seq_len}"
+                        )
+                    strings = (
+                        [params.stop] if isinstance(params.stop, str) else (params.stop or [])
+                    )
+                    stopping = (
+                        StoppingCriteriaList(
+                            [_StopStrings(self.tokenizer, strings, width, params.min_tokens)]
+                        )
+                        if strings
+                        else StoppingCriteriaList()
+                    )
+                    end_id = (
+                        params.end_id
+                        if params.end_id is not None
+                        else self.model.generation_config.eos_token_id
+                    )
+                    if end_id is None:
+                        end_id = self.tokenizer.eos_token_id
+                    pad_id = (
+                        params.pad_id
+                        if params.pad_id is not None
+                        else self.tokenizer.pad_token_id
+                    )
+                    vocabulary_size = self.model.get_input_embeddings().num_embeddings
+                    eos_ids = (
+                        end_id
+                        if isinstance(end_id, list)
+                        else ([end_id] if end_id is not None else [])
+                    )
+                    if any(token >= vocabulary_size for token in [pad_id, *eos_ids]):
+                        raise ValueError("EOS/pad token ID is outside the model vocabulary")
+                    options = {
+                        "max_new_tokens": params.max_tokens,
+                        "min_new_tokens": params.min_tokens,
+                        "do_sample": params.temperature > 0,
+                        "repetition_penalty": params.repetition_penalty,
+                        "pad_token_id": pad_id,
+                        "eos_token_id": None if params.ignore_eos else end_id,
+                        "stopping_criteria": stopping,
+                        "streamer": streamer,
+                        "use_cache": True,
+                        "return_dict_in_generate": False,
+                    }
+                    if params.temperature > 0:
+                        options.update(
+                            temperature=params.temperature,
+                            top_p=params.top_p,
+                            top_k=params.top_k,
+                        )
+                    rng = (
+                        torch.random.fork_rng(
+                            devices=[self.device.index] if self.device.type == "cuda" else []
+                        )
+                        if params.seed is not None
+                        else nullcontext()
+                    )
+                    with rng:
+                        if params.seed is not None:
+                            torch.random.default_generator.manual_seed(params.seed)
+                            if self.device.type == "cuda":
+                                with torch.cuda.device(self.device):
+                                    torch.cuda.manual_seed(params.seed)
+                        generated = self.model.generate(**encoded, **options)
+                    tokens = generated[0, width:].cpu().tolist()
+                    finish_reason = "length"
+                    if not params.ignore_eos:
+                        endings = [
+                            position for position, token in enumerate(tokens) if token in eos_ids
+                        ]
+                        if endings:
+                            tokens = tokens[: endings[0]]
+                            finish_reason = "stop"
+                    elapsed = time.perf_counter() - started
+                    self.last_stats = {
+                        "wall_s": elapsed,
+                        "input_tokens": len(prompt_ids[0]),
+                        "output_tokens": len(tokens),
+                        "tokens_per_s": len(tokens) / elapsed if elapsed else 0.0,
+                    }
+                    state.update(tokens=tokens, finish_reason=finish_reason)
+            except BaseException as error:
+                # A generator exception would otherwise leave the consumer
+                # blocked forever waiting for TextIteratorStreamer's sentinel.
+                state["error"] = error
+                streamer.on_finalized_text("", stream_end=True)
+
+        thread = threading.Thread(target=_run, name="trtllm-rocm-stream", daemon=True)
+        thread.start()
+        pending = ""
+        stopped_by_string = False
+        strings = [params.stop] if isinstance(params.stop, str) else (params.stop or [])
+        holdback = max((len(string) - 1 for string in strings), default=0)
+        try:
+            for delta in streamer:
+                candidate = pending + delta
+                stops = [candidate.find(string) for string in strings if string in candidate]
+                if stops:
+                    text = candidate[: min(stops)]
+                    pending = ""
+                    stopped_by_string = True
+                elif holdback:
+                    split = max(0, len(candidate) - holdback)
+                    text, pending = candidate[:split], candidate[split:]
+                else:
+                    text, pending = candidate, ""
+                if text:
+                    yield StreamOutput(request_id=request_id, text=text)
+        finally:
+            thread.join()
+        if "error" in state:
+            raise state["error"]  # type: ignore[misc]
+        if pending and not stopped_by_string:
+            yield StreamOutput(request_id=request_id, text=pending)
+        finish_reason = "stop" if stopped_by_string else state["finish_reason"]
+        yield StreamOutput(
+            request_id=request_id,
+            text="",
+            finish_reason=finish_reason,  # type: ignore[arg-type]
+            token_ids=state["tokens"],  # type: ignore[arg-type]
+        )
 
     def shutdown(self) -> None:
         """Release model references; do not clear another application's GPU allocator."""
