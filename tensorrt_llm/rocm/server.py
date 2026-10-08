@@ -19,6 +19,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import threading
 import time
 import uuid
 from collections.abc import Iterator
@@ -45,6 +46,7 @@ class CompletionRequest(SamplingParams):
         default=False,
         description="Return OpenAI-compatible server-sent events for one completion.",
     )
+    adapter: str | None = Field(default=None, description="Name of a loaded PEFT adapter.")
 
 
 class ChatMessage(StrictBaseModel):
@@ -61,6 +63,7 @@ class ChatRequest(SamplingParams):
         default=False,
         description="Return OpenAI-compatible server-sent events for one completion.",
     )
+    adapter: str | None = Field(default=None, description="Name of a loaded PEFT adapter.")
 
 
 def _usage(results: list[RequestOutput]) -> dict[str, int]:
@@ -118,12 +121,16 @@ def create_app(engine: LLM, served_model_name: str | None = None) -> FastAPI:
 
     def sampling(request: CompletionRequest | ChatRequest) -> SamplingParams:
         return SamplingParams(
-            **request.model_dump(exclude={"model", "prompt", "messages", "stream"})
+            **request.model_dump(exclude={"model", "prompt", "messages", "stream", "adapter"})
         )
 
-    async def generate(prompt, params: SamplingParams) -> list[RequestOutput]:
+    async def generate(
+        prompt, params: SamplingParams, adapter_name: str | None
+    ) -> list[RequestOutput]:
         try:
-            result = await run_in_threadpool(engine.generate, prompt, params)
+            result = await run_in_threadpool(
+                engine.generate, prompt, params, adapter_name=adapter_name
+            )
             # ``streaming=False`` above guarantees the ordinary list surface.
             return result  # type: ignore[return-value]
         except (ValueError, TypeError, NotImplementedError) as error:
@@ -132,7 +139,7 @@ def create_app(engine: LLM, served_model_name: str | None = None) -> FastAPI:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
     def stream_events(
-        prompt: str | list[int], params: SamplingParams, *, chat: bool
+        prompt: str | list[int], params: SamplingParams, *, chat: bool, adapter_name: str | None
     ) -> Iterator[str]:
         """Bridge the synchronous portable streamer to OpenAI SSE framing."""
         stream_id = ("chatcmpl" if chat else "cmpl") + f"-{uuid.uuid4().hex}"
@@ -149,8 +156,14 @@ def create_app(engine: LLM, served_model_name: str | None = None) -> FastAPI:
                     ],
                 }
             )
+        cancelled = threading.Event()
         try:
-            for output in engine.generate_stream(prompt, params):
+            for output in engine.generate_stream(
+                prompt,
+                params,
+                cancellation_event=cancelled,
+                adapter_name=adapter_name,
+            ):
                 if chat:
                     choice = {
                         "index": 0,
@@ -179,10 +192,12 @@ def create_app(engine: LLM, served_model_name: str | None = None) -> FastAPI:
             yield _sse({"error": {"message": str(error), "type": type(error).__name__}})
         except RuntimeError as error:
             yield _sse({"error": {"message": str(error), "type": "service_unavailable"}})
+        finally:
+            cancelled.set()
         yield _sse("[DONE]")
 
     def streaming_response(
-        prompt: str | list[int], params: SamplingParams, *, chat: bool
+        prompt: str | list[int], params: SamplingParams, *, chat: bool, adapter_name: str | None
     ) -> StreamingResponse:
         if params.n != 1 or params.beam_width != 1:
             raise HTTPException(
@@ -190,7 +205,7 @@ def create_app(engine: LLM, served_model_name: str | None = None) -> FastAPI:
                 detail="Streaming supports n=1 and beam_width=1; use non-streaming for other modes",
             )
         return StreamingResponse(
-            stream_events(prompt, params, chat=chat),
+            stream_events(prompt, params, chat=chat, adapter_name=adapter_name),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -228,8 +243,10 @@ def create_app(engine: LLM, served_model_name: str | None = None) -> FastAPI:
                     status_code=400,
                     detail="Streaming accepts one text prompt or one nonempty list of token IDs",
                 )
-            return streaming_response(request.prompt, params, chat=False)
-        results = await generate(request.prompt, params)
+            return streaming_response(
+                request.prompt, params, chat=False, adapter_name=request.adapter
+            )
+        results = await generate(request.prompt, params, request.adapter)
         choices = [
             {
                 "index": index,
@@ -265,8 +282,8 @@ def create_app(engine: LLM, served_model_name: str | None = None) -> FastAPI:
                 status_code=400, detail=f"Tokenizer chat template required: {error}"
             ) from error
         if request.stream:
-            return streaming_response(prompt, params, chat=True)
-        results = await generate(prompt, params)
+            return streaming_response(prompt, params, chat=True, adapter_name=request.adapter)
+        results = await generate(prompt, params, request.adapter)
         choices = [
             {
                 "index": output.index,

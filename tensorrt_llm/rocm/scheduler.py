@@ -22,6 +22,7 @@ Result = TypeVar("Result")
 class _Job(Generic[Result]):
     run: Callable[[], Result]
     future: asyncio.Future[Result]
+    cancel: Callable[[], None] | None = None
 
 
 class SerializedRequestScheduler:
@@ -42,12 +43,14 @@ class SerializedRequestScheduler:
         if self._worker is None:
             self._worker = asyncio.create_task(self._run(), name="trtllm-rocm-request-scheduler")
 
-    async def submit(self, operation: Callable[[], Result]) -> Result:
+    async def submit(
+        self, operation: Callable[[], Result], *, cancel: Callable[[], None] | None = None
+    ) -> Result:
         if self._closed:
             raise RuntimeError("Request scheduler has been shut down")
         self._ensure_worker()
         future: asyncio.Future[Result] = asyncio.get_running_loop().create_future()
-        job = _Job(operation, future)
+        job = _Job(operation, future, cancel)
         self.submitted += 1
         await self._queue.put(job)
         try:
@@ -56,6 +59,8 @@ class SerializedRequestScheduler:
             # Queued jobs are skipped. Active blocking generation cannot safely
             # be preempted by Python, but its result is discarded.
             future.cancel()
+            if job.cancel is not None:
+                job.cancel()
             self.cancelled += 1
             raise
 

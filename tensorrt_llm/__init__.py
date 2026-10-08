@@ -143,12 +143,14 @@ if _BACKEND == "rocm":
     _LAZY_ATTRS['LLM'] = ('tensorrt_llm.rocm', 'LLM')
     _LAZY_ATTRS['AsyncLLM'] = ('tensorrt_llm.rocm', 'AsyncLLM')
     _LAZY_ATTRS['EmbeddingLLM'] = ('tensorrt_llm.rocm', 'EmbeddingLLM')
+    _LAZY_ATTRS['RCCLContext'] = ('tensorrt_llm.rocm', 'RCCLContext')
+    _LAZY_ATTRS['PagedKVCache'] = ('tensorrt_llm.rocm', 'PagedKVCache')
     _LAZY_ATTRS['SamplingParams'] = ('tensorrt_llm.rocm', 'SamplingParams')
 
 
 def __getattr__(name):
     if _BACKEND == "rocm" and name in _LAZY_ATTRS and name not in (
-            'LLM', 'AsyncLLM', 'EmbeddingLLM', 'SamplingParams'):
+            'LLM', 'AsyncLLM', 'EmbeddingLLM', 'RCCLContext', 'PagedKVCache', 'SamplingParams'):
         raise NotImplementedError(
             f"{name} is NVIDIA-only in this checkout. See docs/source/rocm-rdna4.md for the ROCm support matrix."
         )
@@ -222,7 +224,10 @@ if _BACKEND == "cuda":
     _init()
 else:
     # Do not import bindings, TensorRT, MPI, NVML, FlashInfer, or CUDA custom ops.
-    __all__ = ['LLM', 'AsyncLLM', 'EmbeddingLLM', 'SamplingParams', 'logger', '__version__']
+    __all__ = [
+        'LLM', 'AsyncLLM', 'EmbeddingLLM', 'RCCLContext', 'PagedKVCache', 'SamplingParams',
+        'logger', '__version__'
+    ]
 
 print(
     f"[TensorRT-LLM] TensorRT LLM version: {__version__} (backend: {_BACKEND})")

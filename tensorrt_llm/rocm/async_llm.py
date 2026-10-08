@@ -48,7 +48,13 @@ class AsyncLLM(LLM):
         **kwargs: Any,
     ) -> list[RequestOutput]:
         scheduler = self._request_scheduler()
-        return await scheduler.submit(lambda: self.generate(prompts, sampling_params, **kwargs))
+        cancelled = threading.Event()
+        return await scheduler.submit(
+            lambda: self.generate(
+                prompts, sampling_params, cancellation_event=cancelled, **kwargs
+            ),
+            cancel=cancelled.set,
+        )
 
     async def generate_stream_async(
         self,
@@ -76,7 +82,9 @@ class AsyncLLM(LLM):
 
         def worker() -> None:
             try:
-                for output in self.generate_stream(prompt, sampling_params):
+                for output in self.generate_stream(
+                    prompt, sampling_params, cancellation_event=stopped
+                ):
                     if stopped.is_set() or not put(output):
                         return
             except BaseException as error:  # raised inside the awaiting task

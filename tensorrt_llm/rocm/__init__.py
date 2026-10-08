@@ -22,6 +22,8 @@ __all__ = [
     "LLM",
     "AsyncLLM",
     "EmbeddingLLM",
+    "RCCLContext",
+    "PagedKVCache",
     "SamplingParams",
     "CompletionOutput",
     "RequestOutput",
@@ -36,6 +38,10 @@ def __getattr__(name: str):
         value = importlib.import_module(".async_llm", __name__).AsyncLLM
     elif name == "EmbeddingLLM":
         value = importlib.import_module(".embeddings", __name__).EmbeddingLLM
+    elif name == "RCCLContext":
+        value = importlib.import_module(".distributed", __name__).RCCLContext
+    elif name == "PagedKVCache":
+        value = importlib.import_module(".paged_kv", __name__).PagedKVCache
     else:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     globals()[name] = value
