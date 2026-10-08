@@ -164,6 +164,20 @@ dependency.
   exclusive per request. Outlines remains the route to unrestricted JSON,
   regex, and grammar coverage once constraints must scale beyond the finite
   subset.
+- **Measured evidence for the token-FSM work item:** the `guided_regex`
+  processor's per-step cost is vocabulary-bound because it runs one regex
+  partial match per distinct decoded piece. On real vocabularies that costs
+  4-8 ms per decode step on an 8k-token byte-level BPE vocabulary and 6-17 ms
+  on a 21k-token WordPiece vocabulary, growing to 40-110 ms late in long
+  generations as the matched text lengthens; arithmetic scaling puts a
+  128k-token vocabulary at ~160 ms per step. Token IDs grouped by decoded
+  piece already absorb duplicate decodes (about 41 percent duplicate pieces
+  under WordPiece ``##``-stripping decode versus about 2 percent on byte-level
+  BPE, where only partial-UTF-8 byte tokens collide), which is why grouping
+  helps WordPiece-class vocabularies 1.7-1.9x but is neutral on byte-level
+  BPE. This is the justification for compiling each pattern into a per-request
+  token FSM through the Outlines adapter instead of keeping the
+  O(vocabulary) per-step loop.
 
 ### 8. Distributed execution: RCCL and Iris, only with real topology tests
 
