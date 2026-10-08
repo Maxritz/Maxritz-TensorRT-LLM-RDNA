@@ -36,14 +36,30 @@ class PagedKVCache:
         head_dim: int,
         dtype: torch.dtype,
         device: torch.device | str,
+        quantization: str = "none",
     ) -> None:
         if min(num_layers, num_pages, page_size, num_kv_heads, head_dim) < 1:
             raise ValueError("Paged KV dimensions must be positive")
+        if quantization not in ("none", "int8"):
+            raise ValueError("Paged KV quantization must be none or int8")
         self.page_size = page_size
         self.num_pages = num_pages
+        self.num_layers = num_layers
+        self.dtype = dtype
+        self.quantization = quantization
         shape = (num_layers, num_pages, page_size, num_kv_heads, head_dim)
-        self.keys = torch.empty(shape, dtype=dtype, device=device)
+        storage_dtype = torch.int8 if quantization == "int8" else dtype
+        self.keys = torch.empty(shape, dtype=storage_dtype, device=device)
         self.values = torch.empty_like(self.keys)
+        scale_shape = (*shape[:-1], 1)
+        self.key_scales = (
+            torch.empty(scale_shape, dtype=torch.float32, device=device)
+            if quantization == "int8"
+            else None
+        )
+        self.value_scales = (
+            torch.empty_like(self.key_scales) if self.key_scales is not None else None
+        )
         self._free = list(range(num_pages - 1, -1, -1))
         self._refs = [0] * num_pages
         self._prefixes: dict[tuple[int, ...], PagedSequence] = {}
@@ -109,8 +125,8 @@ class PagedKVCache:
             )
         if (keys.shape[0], keys.shape[2], keys.shape[3]) != expected:
             raise ValueError("K/V append shape does not match this page pool")
-        if keys.device != self.keys.device or keys.dtype != self.keys.dtype:
-            raise ValueError("K/V append tensors must match pool device and dtype")
+        if keys.device != self.keys.device or keys.dtype != self.dtype:
+            raise ValueError("K/V append tensors must match pool device and logical dtype")
         for offset in range(keys.shape[1]):
             page_offset = sequence.length % self.page_size
             if page_offset == 0:
@@ -120,12 +136,37 @@ class PagedKVCache:
                 new_page = self._allocate()
                 self.keys[:, new_page, :page_offset].copy_(self.keys[:, old_page, :page_offset])
                 self.values[:, new_page, :page_offset].copy_(self.values[:, old_page, :page_offset])
+                if self.key_scales is not None:
+                    self.key_scales[:, new_page, :page_offset].copy_(
+                        self.key_scales[:, old_page, :page_offset]
+                    )
+                    self.value_scales[:, new_page, :page_offset].copy_(
+                        self.value_scales[:, old_page, :page_offset]
+                    )
                 sequence.page_ids[-1] = new_page
                 self._release(old_page)
             page = sequence.page_ids[-1]
-            self.keys[:, page, page_offset].copy_(keys[:, offset])
-            self.values[:, page, page_offset].copy_(values[:, offset])
+            if self.key_scales is None:
+                self.keys[:, page, page_offset].copy_(keys[:, offset])
+                self.values[:, page, page_offset].copy_(values[:, offset])
+            else:
+                self._quantize(
+                    keys[:, offset],
+                    self.keys[:, page, page_offset],
+                    self.key_scales[:, page, page_offset],
+                )
+                self._quantize(
+                    values[:, offset],
+                    self.values[:, page, page_offset],
+                    self.value_scales[:, page, page_offset],
+                )
             sequence.length += 1
+
+    @staticmethod
+    def _quantize(source: torch.Tensor, destination: torch.Tensor, scale: torch.Tensor) -> None:
+        value = source.float().abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 127
+        destination.copy_(torch.round(source.float() / value).clamp_(-127, 127).to(torch.int8))
+        scale.copy_(value)
 
     def materialize(self, sequence: PagedSequence) -> tuple[torch.Tensor, torch.Tensor]:
         """Return contiguous `[layers, tokens, heads, dim]` tensors for a backend adapter."""
@@ -133,11 +174,20 @@ class PagedKVCache:
         remaining = sequence.length
         for page in sequence.page_ids:
             width = min(remaining, self.page_size)
-            key_parts.append(self.keys[:, page, :width])
-            value_parts.append(self.values[:, page, :width])
+            keys = self.keys[:, page, :width]
+            values = self.values[:, page, :width]
+            if self.key_scales is not None:
+                keys = (keys.float() * self.key_scales[:, page, :width]).to(self.dtype)
+                values = (values.float() * self.value_scales[:, page, :width]).to(self.dtype)
+            key_parts.append(keys)
+            value_parts.append(values)
             remaining -= width
         if not key_parts:
-            empty = self.keys[:, 0, :0]
+            empty = torch.empty(
+                (self.num_layers, 0, self.keys.shape[3], self.keys.shape[4]),
+                dtype=self.dtype,
+                device=self.keys.device,
+            )
             return empty, empty.clone()
         return torch.cat(key_parts, dim=1), torch.cat(value_parts, dim=1)
 

@@ -51,9 +51,9 @@ dependency.
 | Dense MHA/MQA/GQA attention | SDPA/eager plus small native HIP kernel | Default PyTorch SDPA/AOTriton; optional RDNA AITER FlashAttention | P1 kernel path |
 | Flash attention / FMHA / FlashInfer | **Not ported** | AITER gfx1201 FlyDSL flash-attention kernel; AOTriton/PyTorch SDPA fallback | P1, target GPU qualification |
 | MLA, sparse/skip-softmax attention | **Not ported** | AITER/vLLM ROCm implementations are reference material; port only algorithms with a native RDNA4 path | P4; model-specific |
-| Paged attention and paged KV manager | **Partial** | Portable page allocator/refcount/copy-on-write prefix sharing is available as `PagedKVCache`; an attention backend adapter and RDNA decode kernel remain required before executor use | P1 scheduler + P2 kernel |
+| Paged attention and paged KV manager | **Partial** | `PagedKVCache` has page allocation/refcount/COW prefix sharing and `paged_attention` provides a portable HIP/PyTorch execution fallback; a fused RDNA decode kernel and HF cache adapter remain | P1 scheduler + P2 kernel |
 | Prefix cache / prefix tokenization cache | **Not ported** | Token-ID prefix trie first, then page-level KV sharing after paged cache exists | P2; depends on paged KV |
-| Chunked prefill, IFB, request scheduling, overlap scheduler | **Not ported** | New small async scheduler around a backend-neutral request/page contract | P1; must precede throughput claims |
+| Chunked prefill, IFB, request scheduling, overlap scheduler | **Partial** | `ContinuousBatchScheduler` now defines admission and token-step decode rounds over live page-table requests; an HF cache adapter must supply its prefill/decode callbacks before serving integration | P1; must precede throughput claims |
 | CUDA graphs / piecewise graphs | **Not ported** | Qualify PyTorch `torch.cuda.CUDAGraph` under HIP and call the result a HIP graph | P3; fixed-shape scheduler required |
 | Additional outputs / prompt and completion logprobs | **Not ported** | Portable logits processors and selected-token `log_softmax`; do not materialize all vocabulary logits by default | P1 |
 | Advanced sampling (bad/stop token IDs, penalties, min-p, logits processors) | Partial | Extend portable sampler before replacing it with a fused GPU sampler | P1 |
@@ -62,7 +62,7 @@ dependency.
 | AsyncLLM, cancellation, backpressure | **Partial** | `AsyncLLM` has a bounded serialized queue and async stream bridge; queued cancellation works, while active model cancellation still needs scheduler/request lifecycle support in the generation loop | P1 |
 | LoRA / multi-LoRA and adapter cache | **Partial** | Optional PEFT single-adapter load/optional merge is implemented; add an adapter registry and batched fused LoRA only after the scheduler/GEMM path | P2 then P4 |
 | Quantized weights, quantized KV, ModelOpt formats | **Partial** | Explicit bitsandbytes 4/8-bit HF loading is available behind a real ROCm-device dependency; quantized KV, ModelOpt formats, accuracy and performance gates remain | P2, each format needs accuracy/perf gates |
-| KV cache compression/offload | **Not ported** | Start with host offload and a documented copy path; no NVFP4/cold-page reuse until quantized KV kernel exists | P4 |
+| KV cache compression/offload | **Partial** | `PagedKVCache(quantization="int8")` stores per-token/head scaled INT8 K/V and dequantizes at portable attention dispatch; host offload, NVFP4 and fused quantized decode remain | P4 |
 | Speculative decoding (draft/target, n-gram, EAGLE, MTP, PARD, DFlash) | **Partial** | HF assisted draft/target generation is available for non-streaming `n=1`/beam-1 requests; scheduler-aware acceptance kernels and advanced variants remain | P3, requires paged KV + logprobs |
 | Encoder-only embeddings / reranking | **Partial** | `EmbeddingLLM`, AutoModel hidden-state mean/CLS/last-token pooling and a standalone `/v1/embeddings` server are implemented; reranker, dynamic batching and dimension projection remain | P1 |
 | Multimodal LLM | **Not ported** | Transformers processor/model path, then batched vision encoder scheduling | P3, per-model qualification |
