@@ -57,7 +57,7 @@ dependency.
 | CUDA graphs / piecewise graphs | **Not ported** | Qualify PyTorch `torch.cuda.CUDAGraph` under HIP and call the result a HIP graph | P3; fixed-shape scheduler required |
 | Additional outputs / prompt and completion logprobs | **Not ported** | Portable logits processors and selected-token `log_softmax`; do not materialize all vocabulary logits by default | P1 |
 | Advanced sampling (bad/stop token IDs, penalties, min-p, logits processors) | Partial | Extend portable sampler before replacing it with a fused GPU sampler | P1 |
-| Guided decoding (JSON, regex, grammar, structural tags) | **Partial** | Portable exact `guided_choice` token-prefix mask is implemented; JSON/regex/grammar require an Outlines constraint adapter and tokenizer qualification | P2; portable sampler required |
+| Guided decoding (JSON, regex, grammar, structural tags) | **Partial** | Portable exact `guided_choice` token-prefix mask, a finite `guided_json_schema` subset (`const`/`enum`/boolean/null, fixed-length arrays, closed objects) compiled to canonical JSON alternatives on the same mask, and a host-side `guided_regex` partial-match processor; unrestricted JSON/grammar still route through an Outlines constraint adapter plus tokenizer qualification | P2; portable sampler done, GPU qualification required |
 | Streaming, OpenAI SSE | **Implemented, constrained** | Transformers `TextIteratorStreamer` and SSE adapter | P0 complete; GPU qualification still required |
 | AsyncLLM, cancellation, backpressure | **Partial** | `AsyncLLM` has a bounded serialized queue and async stream bridge; queued cancellation works, while active model cancellation still needs scheduler/request lifecycle support in the generation loop | P1 |
 | LoRA / multi-LoRA and adapter cache | **Partial** | PEFT adapter loading/routing plus `grouped_lora_linear` adapter-grouped ROCm GEMM correctness path are available; model-wide PEFT module replacement and a fused kernel remain | P2 then P4 |
@@ -156,6 +156,28 @@ dependency.
   mask consumed by the portable sampler. This makes correctness testable on CPU
   and avoids claiming an xgrammar CUDA integration works on HIP. Cache compiled
   constraints by tokenizer/model/schema hash.
+- **Implemented portable baseline:** exact `guided_choice`, a deliberately
+  finite `guided_json_schema` subset (`const`, `enum`, booleans, nulls,
+  fixed-length arrays, closed objects) whose compiler emits canonical JSON
+  alternatives that reuse the token-prefix mask, and a host-side
+  `guided_regex` partial-match logits processor; the three guides are mutually
+  exclusive per request. Outlines remains the route to unrestricted JSON,
+  regex, and grammar coverage once constraints must scale beyond the finite
+  subset.
+- **Measured evidence for the token-FSM work item:** the `guided_regex`
+  processor's per-step cost is vocabulary-bound because it runs one regex
+  partial match per distinct decoded piece. On real vocabularies that costs
+  4-8 ms per decode step on an 8k-token byte-level BPE vocabulary and 6-17 ms
+  on a 21k-token WordPiece vocabulary, growing to 40-110 ms late in long
+  generations as the matched text lengthens; arithmetic scaling puts a
+  128k-token vocabulary at ~160 ms per step. Token IDs grouped by decoded
+  piece already absorb duplicate decodes (about 41 percent duplicate pieces
+  under WordPiece ``##``-stripping decode versus about 2 percent on byte-level
+  BPE, where only partial-UTF-8 byte tokens collide), which is why grouping
+  helps WordPiece-class vocabularies 1.7-1.9x but is neutral on byte-level
+  BPE. This is the justification for compiling each pattern into a per-request
+  token FSM through the Outlines adapter instead of keeping the
+  O(vocabulary) per-step loop.
 
 ### 8. Distributed execution: RCCL and Iris, only with real topology tests
 

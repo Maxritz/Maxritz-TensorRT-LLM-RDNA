@@ -21,6 +21,8 @@ from pydantic import Field, model_validator
 
 from tensorrt_llm._config import StrictBaseModel
 
+from .guided import compile_partial_regex, json_schema_alternatives
+
 
 class SamplingParams(StrictBaseModel):
     """ROCm decoding parameters; unsupported upstream options are rejected."""
@@ -63,6 +65,21 @@ class SamplingParams(StrictBaseModel):
         default=None,
         description="Optional exact completion choices, enforced by a portable token-prefix mask.",
     )
+    guided_json_schema: dict | None = Field(
+        default=None,
+        description=(
+            "Optional finite JSON-Schema subset (const, enum, booleans, nulls, fixed-length "
+            "arrays, closed objects); it compiles to canonical JSON alternatives on the same "
+            "token-prefix mask."
+        ),
+    )
+    guided_regex: str | None = Field(
+        default=None,
+        description=(
+            "Optional regular-expression constraint, enforced by a host-side "
+            "partial-match logits processor."
+        ),
+    )
 
     @model_validator(mode="after")
     def _check_constraints(self) -> "SamplingParams":
@@ -75,11 +92,30 @@ class SamplingParams(StrictBaseModel):
         strings = [self.stop] if isinstance(self.stop, str) else (self.stop or [])
         if any(not string for string in strings):
             raise ValueError("Stop strings must not be empty")
+        guides = [
+            name
+            for name, value in (
+                ("guided_choice", self.guided_choice),
+                ("guided_json_schema", self.guided_json_schema),
+                ("guided_regex", self.guided_regex),
+            )
+            if value is not None
+        ]
+        if len(guides) > 1:
+            raise ValueError(
+                f"{', '.join(guides)} are mutually exclusive; set at most one guided constraint"
+            )
         if self.guided_choice is not None:
             if not self.guided_choice or any(not choice for choice in self.guided_choice):
                 raise ValueError("guided_choice must contain one or more nonempty strings")
             if len(set(self.guided_choice)) != len(self.guided_choice):
                 raise ValueError("guided_choice values must be unique")
+        if self.guided_regex is not None:
+            compile_partial_regex(self.guided_regex)
+        if self.guided_json_schema is not None and not json_schema_alternatives(
+            self.guided_json_schema
+        ):
+            raise ValueError("guided_json_schema must expand to at least one JSON alternative")
         return self
 
 

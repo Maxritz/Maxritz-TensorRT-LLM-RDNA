@@ -38,6 +38,7 @@ from transformers import (
 
 from trtllm_profile import active_session, component, trace_active
 
+from .guided import compile_partial_regex, json_schema_alternatives
 from .runtime import KernelBackend, resolve_device, resolve_dtype
 from .sampling import CompletionOutput, RequestOutput, SamplingParams, StreamOutput
 
@@ -85,27 +86,96 @@ class _CancellationCriteria(StoppingCriteria):
 
 
 class _ChoiceProcessor(LogitsProcessor):
-    """Portable exact-choice constrained decoding without a CUDA grammar runtime."""
+    """Portable exact-choice constrained decoding without a CUDA grammar runtime.
+
+    Choices are indexed in a token-prefix trie once, so each decoding step
+    walks the generated suffix and reads the allowed continuations in time
+    proportional to the generated length instead of scanning every choice.
+    A ``-1`` marker flags finished choices, which admit the EOS tokens.
+    """
 
     def __init__(self, choices: list[list[int]], prompt_width: int, eos_ids: list[int]) -> None:
         self.choices = choices
         self.prompt_width = prompt_width
         self.eos_ids = eos_ids
+        self._root: dict = {}
+        for choice in choices:
+            node = self._root
+            for token in choice:
+                node = node.setdefault(token, {})
+            node[-1] = True
 
     def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         constrained = torch.full_like(scores, -float("inf"))
         for row, sequence in enumerate(input_ids.tolist()):
-            generated = sequence[self.prompt_width :]
-            allowed = set()
-            for choice in self.choices:
-                if choice[: len(generated)] != generated:
-                    continue
-                if len(generated) == len(choice):
-                    allowed.update(self.eos_ids)
-                else:
-                    allowed.add(choice[len(generated)])
+            node = self._root
+            for token in sequence[self.prompt_width :]:
+                node = node.get(token)
+                if node is None:
+                    break
+            allowed = {token for token in node if token != -1} if node is not None else set()
+            if node is not None and -1 in node:
+                allowed.update(self.eos_ids)
             if not allowed:
                 raise ValueError("guided_choice has no valid token continuation")
+            constrained[row, list(allowed)] = scores[row, list(allowed)]
+        return constrained
+
+
+class _RegexProcessor(LogitsProcessor):
+    """Host-side regular-expression partial-match masking without a grammar runtime.
+
+    A token is allowed only when the generated text plus that token's decoded
+    piece can still grow into a full match of the pattern; EOS is allowed once
+    the generated text already matches completely. This shares the same
+    logits-masking contract as :class:`_ChoiceProcessor` but evaluates
+    partial matches instead of finite token sequences. Token IDs are grouped
+    by decoded piece at construction, so each step performs one partial match
+    per distinct piece string.
+    """
+
+    def __init__(
+        self,
+        pattern,
+        tokenizer: PreTrainedTokenizerBase,
+        prompt_width: int,
+        eos_ids: list[int],
+        vocabulary_size: int,
+    ) -> None:
+        self.pattern = pattern
+        self.tokenizer = tokenizer
+        self.prompt_width = prompt_width
+        self.eos_ids = eos_ids
+        # Distinct piece strings with their token IDs: several IDs commonly
+        # decode to one piece, and one partial match then serves all of them.
+        groups: dict[str, list[int]] = {}
+        self._pieces: list[str] = []
+        token_ids: list[list[int]] = []
+        for token in range(vocabulary_size):
+            piece = tokenizer.decode([token])
+            ids = groups.get(piece)
+            if ids is None:
+                ids = groups[piece] = []
+                self._pieces.append(piece)
+            ids.append(token)
+            token_ids.append(ids)
+        self._token_ids = token_ids
+
+    def __call__(self, input_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
+        constrained = torch.full_like(scores, -float("inf"))
+        fullmatch = self.pattern.fullmatch
+        decode = self.tokenizer.decode
+        for row, sequence in enumerate(input_ids.tolist()):
+            generated = sequence[self.prompt_width :]
+            text = decode(generated, skip_special_tokens=True)
+            allowed = set()
+            if self.eos_ids and fullmatch(text):
+                allowed.update(self.eos_ids)
+            for piece, tokens in zip(self._pieces, self._token_ids):
+                if fullmatch(text + piece, partial=True):
+                    allowed.update(tokens)
+            if not allowed:
+                raise ValueError("guided_regex has no valid token continuation")
             constrained[row, list(allowed)] = scores[row, list(allowed)]
         return constrained
 
@@ -444,9 +514,14 @@ class LLM:
     def _speculative_options(self, params: SamplingParams) -> dict:
         if self.draft_model is None:
             return {}
-        if params.n != 1 or params.beam_width != 1 or params.guided_choice is not None:
+        guided = (
+            params.guided_choice is not None
+            or params.guided_json_schema is not None
+            or params.guided_regex is not None
+        )
+        if params.n != 1 or params.beam_width != 1 or guided:
             raise NotImplementedError(
-                "draft-model decoding requires n=1, beam_width=1, and no guided_choice"
+                "draft-model decoding requires n=1, beam_width=1, and no guided constraint"
             )
         return {
             "assistant_model": self.draft_model,
@@ -470,18 +545,44 @@ class LLM:
     def _guided_processors(
         self, params: SamplingParams, prompt_width: int, eos_ids: list[int]
     ) -> list[LogitsProcessor] | None:
-        if params.guided_choice is None:
-            return None
-        choices = [
-            self.tokenizer.encode(choice, add_special_tokens=False)
-            for choice in params.guided_choice
+        guides = [
+            name
+            for name in ("guided_choice", "guided_json_schema", "guided_regex")
+            if getattr(params, name) is not None
         ]
+        if len(guides) > 1:
+            raise ValueError(
+                "guided_choice, guided_json_schema, and guided_regex are mutually exclusive"
+            )
+        if not guides:
+            return None
+        guide = guides[0]
+        if guide == "guided_regex":
+            if not eos_ids:
+                raise ValueError("guided_regex requires an EOS token")
+            return [
+                _RegexProcessor(
+                    compile_partial_regex(params.guided_regex),
+                    self.tokenizer,
+                    prompt_width,
+                    eos_ids,
+                    self.model.get_input_embeddings().num_embeddings,
+                )
+            ]
+        # guided_choice strings and compiled JSON-Schema alternatives share the
+        # exact token-prefix masking path below.
+        texts = (
+            params.guided_choice
+            if guide == "guided_choice"
+            else json_schema_alternatives(params.guided_json_schema)
+        )
+        choices = [self.tokenizer.encode(text, add_special_tokens=False) for text in texts]
         if any(not choice for choice in choices):
-            raise ValueError("A guided_choice cannot encode to an empty token sequence")
+            raise ValueError(f"A {guide} cannot encode to an empty token sequence")
         if not eos_ids:
-            raise ValueError("guided_choice requires an EOS token")
+            raise ValueError(f"{guide} requires an EOS token")
         if any(len(choice) > params.max_tokens for choice in choices):
-            raise ValueError("guided_choice length exceeds max_tokens")
+            raise ValueError(f"{guide} length exceeds max_tokens")
         return [_ChoiceProcessor(choices, prompt_width, eos_ids)]
 
     def generate(
