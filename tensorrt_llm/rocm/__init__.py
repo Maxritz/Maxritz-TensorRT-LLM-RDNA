@@ -18,12 +18,26 @@ import importlib
 
 from .sampling import CompletionOutput, RequestOutput, SamplingParams, StreamOutput
 
-__all__ = ["LLM", "SamplingParams", "CompletionOutput", "RequestOutput", "StreamOutput"]
+__all__ = [
+    "LLM",
+    "AsyncLLM",
+    "EmbeddingLLM",
+    "SamplingParams",
+    "CompletionOutput",
+    "RequestOutput",
+    "StreamOutput",
+]
 
 
 def __getattr__(name: str):
     if name == "LLM":
         value = importlib.import_module(".llm", __name__).LLM
-        globals()[name] = value
-        return value
+    elif name == "AsyncLLM":
+        value = importlib.import_module(".async_llm", __name__).AsyncLLM
+    elif name == "EmbeddingLLM":
+        value = importlib.import_module(".embeddings", __name__).EmbeddingLLM
+    else:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    globals()[name] = value
+    return value
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

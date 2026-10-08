@@ -92,6 +92,8 @@ class LLM:
         revision: str | None = None,
         trust_remote_code: bool = False,
         local_files_only: bool = False,
+        lora_adapter: str | Path | None = None,
+        merge_lora: bool = False,
         tensor_parallel_size: int = 1,
         pipeline_parallel_size: int = 1,
         **unsupported,
@@ -168,6 +170,23 @@ class LLM:
                     "This Transformers model does not support the native attention interface"
                 )
             self.model = loaded.eval().to(device=self.device, dtype=self.dtype)
+            if lora_adapter is not None:
+                try:
+                    from peft import PeftModel
+                except ImportError as error:
+                    raise RuntimeError(
+                        "LoRA adapters require the optional 'peft' package; install PEFT "
+                        "before passing lora_adapter"
+                    ) from error
+                adapter = str(lora_adapter)
+                self.model = PeftModel.from_pretrained(
+                    self.model, adapter, is_trainable=False, local_files_only=local_files_only
+                ).eval()
+                if merge_lora:
+                    self.model = self.model.merge_and_unload().eval()
+                self.model = self.model.to(device=self.device, dtype=self.dtype)
+            elif merge_lora:
+                raise ValueError("merge_lora requires lora_adapter")
             if isinstance(tokenizer, PreTrainedTokenizerBase):
                 self.tokenizer = tokenizer
             else:

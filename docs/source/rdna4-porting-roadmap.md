@@ -59,12 +59,12 @@ dependency.
 | Advanced sampling (bad/stop token IDs, penalties, min-p, logits processors) | Partial | Extend portable sampler before replacing it with a fused GPU sampler | P1 |
 | Guided decoding (JSON, regex, grammar, structural tags) | **Not ported** | Token mask adapter using Outlines; compare with xgrammar only after its ROCm contract is verified | P2; portable sampler required |
 | Streaming, OpenAI SSE | **Implemented, constrained** | Transformers `TextIteratorStreamer` and SSE adapter | P0 complete; GPU qualification still required |
-| AsyncLLM, cancellation, backpressure | **Not ported** | New asyncio request lifecycle over the scheduler; do not import CUDA `AsyncLLM` | P1 |
-| LoRA / multi-LoRA and adapter cache | **Not ported** | PEFT single-adapter load/merge first; add an adapter registry and batched fused LoRA only after GEMM path | P2 then P4 |
+| AsyncLLM, cancellation, backpressure | **Partial** | `AsyncLLM` has a bounded serialized queue and async stream bridge; queued cancellation works, while active model cancellation still needs scheduler/request lifecycle support in the generation loop | P1 |
+| LoRA / multi-LoRA and adapter cache | **Partial** | Optional PEFT single-adapter load/optional merge is implemented; add an adapter registry and batched fused LoRA only after the scheduler/GEMM path | P2 then P4 |
 | Quantized weights, quantized KV, ModelOpt formats | **Not ported** | bitsandbytes for 8/4-bit compatibility; AITER quant/GEMM for RDNA4 experiments; GGUF/llama.cpp as a separate serving route | P2, each format needs accuracy/perf gates |
 | KV cache compression/offload | **Not ported** | Start with host offload and a documented copy path; no NVFP4/cold-page reuse until quantized KV kernel exists | P4 |
 | Speculative decoding (draft/target, n-gram, EAGLE, MTP, PARD, DFlash) | **Not ported** | HF assisted generation/draft-target baseline, then scheduler-aware acceptance kernels | P3, requires paged KV + logprobs |
-| Encoder-only embeddings / reranking | **Not ported** | `AutoModel`/`AutoModelForSequenceClassification`, pooling and `/v1/embeddings`; SDPA/eager first | P1 |
+| Encoder-only embeddings / reranking | **Partial** | `EmbeddingLLM`, AutoModel hidden-state mean/CLS/last-token pooling and a standalone `/v1/embeddings` server are implemented; reranker, dynamic batching and dimension projection remain | P1 |
 | Multimodal LLM | **Not ported** | Transformers processor/model path, then batched vision encoder scheduling | P3, per-model qualification |
 | Visual generation, quantized/sparse VisualGen, VisualGen graph | **Not ported** | Separate Diffusers/ROCm pipeline; NVIDIA CUTEDSL/FlashInfer code cannot be transplanted | P5 |
 | MoE routing / fused MoE | **Not ported** | Dense/eager correctness baseline, then AITER RDNA-compatible GEMM/router kernels | P4; target-specific |

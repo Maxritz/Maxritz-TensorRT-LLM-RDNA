@@ -52,6 +52,10 @@ def _model_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--revision")
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--local-files-only", action="store_true")
+    parser.add_argument("--lora-adapter", help="Static PEFT LoRA adapter path or model ID")
+    parser.add_argument(
+        "--merge-lora", action="store_true", help="Merge a static PEFT LoRA adapter after loading"
+    )
     parser.add_argument(
         "--profile", action="store_true", help="Record component, per-file and utilization reports"
     )
@@ -94,6 +98,8 @@ def _llm(options: argparse.Namespace):
         revision=options.revision,
         trust_remote_code=options.trust_remote_code,
         local_files_only=options.local_files_only,
+        lora_adapter=options.lora_adapter,
+        merge_lora=options.merge_lora,
     )
 
 
@@ -198,6 +204,67 @@ def _serve(options: argparse.Namespace) -> None:
     )
 
 
+def _embedding_llm(options: argparse.Namespace):
+    from .embeddings import EmbeddingLLM
+
+    model = options.model_option or options.model
+    if not model:
+        raise ValueError("Provide a model ID/path using the positional model or --model")
+    if options.model_option and options.model and options.model_option != options.model:
+        raise ValueError("Do not specify two different model sources")
+    if options.lora_adapter or options.merge_lora:
+        raise NotImplementedError(
+            "Static PEFT adapters are currently available for causal generation only"
+        )
+    return EmbeddingLLM(
+        model=model,
+        tokenizer=options.tokenizer,
+        device=options.device,
+        dtype=options.dtype,
+        max_batch_size=options.max_batch_size,
+        pooling=options.pooling,
+        normalize=not options.no_normalize,
+        revision=options.revision,
+        trust_remote_code=options.trust_remote_code,
+        local_files_only=options.local_files_only,
+    )
+
+
+def _embed(options: argparse.Namespace) -> None:
+    with _embedding_llm(options) as engine:
+        results = engine.encode(options.input or ["Hello, my name is"])
+        print(
+            json.dumps(
+                {
+                    "object": "list",
+                    "data": [
+                        {"object": "embedding", "embedding": item.embedding, "index": item.index}
+                        for item in results
+                    ],
+                    "model": engine.model_id,
+                    "usage": {
+                        "prompt_tokens": sum(len(item.token_ids) for item in results),
+                        "total_tokens": sum(len(item.token_ids) for item in results),
+                    },
+                }
+            )
+        )
+
+
+def _serve_embeddings(options: argparse.Namespace) -> None:
+    import uvicorn
+
+    from .embedding_server import create_embedding_app
+
+    engine = _embedding_llm(options)
+    uvicorn.run(
+        create_embedding_app(engine, served_model_name=options.served_model_name),
+        host=options.host,
+        port=options.port,
+        workers=1,
+    )
+
+
 def _generate(options: argparse.Namespace) -> None:
     with _llm(options) as engine:
         for result in engine.generate(options.prompt or ["Hello, my name is"], _params(options)):
@@ -226,6 +293,11 @@ def _parser(command: str, program: str) -> argparse.ArgumentParser:
     if command in ("generate", "bench"):
         _sampling_arguments(parser)
         parser.add_argument("--prompt", action="append")
+    if command in ("embed", "serve-embeddings"):
+        if command == "embed":
+            parser.add_argument("--input", action="append", help="Text to encode (repeatable)")
+        parser.add_argument("--pooling", choices=("mean", "cls", "last_token"), default="mean")
+        parser.add_argument("--no-normalize", action="store_true")
     if command == "bench":
         parser.add_argument("--benchmark", choices=("throughput", "latency"), default="throughput")
         parser.add_argument(
@@ -234,7 +306,7 @@ def _parser(command: str, program: str) -> argparse.ArgumentParser:
         parser.add_argument("--warmup", type=int, default=1)
         parser.add_argument("--iterations", type=_positive, default=3)
         parser.add_argument("--output", help="Write benchmark JSON")
-    if command == "serve":
+    if command in ("serve", "serve-embeddings"):
         parser.add_argument(
             "--host", default="127.0.0.1", help="Bind address; defaults to loopback only"
         )
@@ -261,7 +333,13 @@ def _run(command: str, argv: list[str] | None, program: str) -> None:
     ):
         parser.error("Profile options require --profile")
     try:
-        {"generate": _generate, "bench": _benchmark, "serve": _serve}[command](options)
+        {
+            "generate": _generate,
+            "bench": _benchmark,
+            "serve": _serve,
+            "embed": _embed,
+            "serve-embeddings": _serve_embeddings,
+        }[command](options)
     except (ValueError, NotImplementedError, RuntimeError) as error:
         if profiler is not None:
             profiler.status = f"failed: {type(error).__name__}"
@@ -286,12 +364,14 @@ def main(argv: list[str] | None = None) -> None:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if not arguments or arguments[0] in ("--help", "-h"):
         print(
-            "trtllm-rdna4 {doctor,generate,bench,serve,validate} [options] [--profile]\n"
-            "Use '<command> --help' for command options. GPU devices use PyTorch's HIP 'cuda:N' namespace."
+            "trtllm-rdna4 {doctor,generate,embed,bench,serve,serve-embeddings,validate} "
+            "[options] [--profile]\n"
+            "Use '<command> --help' for command options. GPU devices use PyTorch's HIP "
+            "'cuda:N' namespace."
         )
         return
     command, tail = arguments[0], arguments[1:]
-    if command in ("generate", "bench", "serve"):
+    if command in ("generate", "embed", "bench", "serve", "serve-embeddings"):
         _run(command, tail, f"trtllm-rdna4 {command}")
     elif command == "doctor":
         parser = argparse.ArgumentParser(prog="trtllm-rdna4 doctor")
